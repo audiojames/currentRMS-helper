@@ -1,4 +1,4 @@
-# currentRMS-helper 2.0.13
+# currentRMS-helper 2.0.14
 This is a Chrome extension to add functionality to the CurrentRMS web interface. It was created out of our frustration waiting on "quality of life" modifications to make the user experience better. Since making it available online, I've been blown away by how many users and businesses have started using it on a daily basis. I'm really grateful to the many users who have contributed ideas, or pointed out bugs with the extension.
 
 The extension is free to all, but as a few people have asked, if you really want to [buy me a cup of coffee / tea / beer](https://paypal.me/garethrisdale) you can use this link.
@@ -34,7 +34,10 @@ Aside from the Chrome Desktop Browser, users have successfully used this extensi
 For a full list of the extension's features, check out the [Features.md](/Features.md).
 
 
-## New Featur
+## New Features
+
+- NEW: 2.0.14 - Copy Assets to Opportunity - In Detail View, the Actions menu now includes a "Copy Assets to Opportunity..." option. This allows you to quickly copy all allocated, prepared, or booked out assets from the current opportunity to another opportunity. Simply click the option, enter the destination opportunity ID, and the extension will automatically allocate all assets. This is particularly useful when creating similar jobs or moving equipment between related opportunities.
+
 - FIXED: 2.0.13 - Warehouse notes editing was broken (issue 134).
 
 - FIXED: 2.0.13 - Editing chargable days of Service items was broken.
