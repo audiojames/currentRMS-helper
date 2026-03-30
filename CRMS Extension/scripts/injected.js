@@ -7,8 +7,53 @@ window.addEventListener('message', event => {
         console.log("TEST TEST TEST")
     } else if (event.data.type === 'add-details') {
         addEditableDays();
+    } else if (event.data.type === 'sync-opportunity-datetime-picker') {
+        syncOpportunityDatetimePicker(event.data.payload);
     }
 });
+
+
+function syncOpportunityDatetimePicker(payload) {
+    if (!payload || !payload.inputId || !payload.isoValue || typeof $ === 'undefined' || typeof moment === 'undefined') {
+        return;
+    }
+
+    const input = document.getElementById(payload.inputId);
+
+    if (!input) {
+        return;
+    }
+
+    const picker = $(input).data('daterangepicker');
+
+    if (!picker) {
+        return;
+    }
+
+    const nextMoment = moment(payload.isoValue);
+
+    picker.setStartDate(nextMoment);
+    picker.startDate = nextMoment.clone();
+    picker.oldStartDate = nextMoment.clone();
+    picker.endDate = nextMoment.clone();
+    picker.oldEndDate = nextMoment.clone();
+
+    if (typeof picker.updateView === 'function') {
+        picker.updateView();
+    }
+
+    if (typeof picker.updateCalendars === 'function') {
+        picker.updateCalendars();
+    }
+
+    if (typeof picker.updateElement === 'function') {
+        picker.updateElement();
+    }
+
+    if (picker.container && picker.container.find) {
+        picker.container.find('input[name="daterangepicker_start"]').val(payload.displayValue);
+    }
+}
 
 
 function addEditableDays() {

@@ -36,6 +36,7 @@ For a full list of the extension's features, check out the [Features.md](/Featur
 
 ## New Featur
 - NEW: 2.0.14 - Added a Functions menu option, “Transfer out”, to send selected assets to another opportunity via the built-in quick_allocate endpoint (no API key needed).
+- NEW: 2.0.14 - Edit Opportunity Scheduling now has an optional "Update Others" button to shift the other scheduling dates by the same date change, while leaving Document Date untouched.
 - FIXED: 2.0.13 - Warehouse notes editing was broken (issue 134).
 
 - FIXED: 2.0.13 - Editing chargable days of Service items was broken.
