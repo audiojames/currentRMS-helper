@@ -1,4 +1,4 @@
-// NOTE: This code deals with two types of messages. ToastMessages are the type that appear via websocket message to the page. This includes things like sucess messages when an item is scanned. The other type I have called toastPosts, which appear following a php page refresh. This applies to certain scenarios, like reverting the status on an item. FYI Current calls the dialog boxes in the top corner "toast messages", which is where the toast thing comes from.
+// NOTE: This code deals with two types of messages. ToastMessages are the type that appear via websocket message to the page. This includes things like success messages when an item is scanned. The other type I have called toastPosts, which appear following a php page refresh. This applies to certain scenarios, like reverting the status on an item. FYI Current calls the dialog boxes in the top corner "toast messages", which is where the toast thing comes from.
 console.log("CurrentRMS Helper Activated.");
 
 
@@ -55,9 +55,11 @@ wrongItem = "";
 containers = [];
 containerList = [];
 
-let containerisationData;
+let containerisationData; // this is for working out weights on the page
 
 let containerUnderEdit;
+
+let containerCheck = true;
 
 bookedOutWeight = 0;
 subhireWeight = 0;
@@ -67,14 +69,18 @@ stockWeight = 0;
 detailViewMode = "functions";
 allProducts = {};
 allStock = {};
-containerDataList = [];
-containerData = {};
+containerDataList = []; // retrieved API generated list of containers
+containerData = {}; // retrieved API generated object of container contents
+containerItems = []; // retrieved API generated set of items that are container components
+
 storeLocation = "";
 apiKey="";
 apiSubdomain="";
 lastScan="";
 smartScan = false;
+smartScanTarget = "";
 smartScanCandidates = {};
+smartScanCandidateLines = 0;
 revertScan = false;
 removeScan = false;
 addDetailsRunning = false;
@@ -85,6 +91,9 @@ pickerQtyMemory = new Map();
 pickerChosenQtyMemory = new Map();
 pickerPageStorage = new Map();
 rowsAdded = false;
+detailControlsObserverStarted = false;
+detailControlsAddScheduled = false;
+detailControlsDblClickBound = false;
 
 
 blockQuarantines = true;
@@ -102,6 +111,47 @@ console.log(`Content.js was triggered at ${performance.now()}ms`);
 
 // check if we're scraping warehouse notes for another window
 pageUrl = window.location.href;
+let currentOpportunityNavigationKey = getOpportunityNavigationKey(window.location.href);
+let lastObservedHref = window.location.href;
+
+function getOpportunityNavigationKey(href) {
+	try {
+		const url = new URL(href);
+		const match = url.pathname.match(/^\/opportunities\/(\d+)\/?$/);
+		if (!match){
+			return null;
+		}
+		const view = url.searchParams.get("view") || "o";
+		return `${match[1]}:${view}`;
+	} catch (err) {
+		return null;
+	}
+}
+
+setInterval(() => {
+	if (window.location.href === lastObservedHref){
+		return;
+	}
+
+	const nextHref = window.location.href;
+	const nextOpportunityNavigationKey = getOpportunityNavigationKey(nextHref);
+	console.log("CurrentRMS Helper navigation detected:", {
+		from: lastObservedHref,
+		to: nextHref,
+		currentOpportunityNavigationKey,
+		nextOpportunityNavigationKey
+	});
+
+	lastObservedHref = nextHref;
+
+	if (currentOpportunityNavigationKey && nextOpportunityNavigationKey && currentOpportunityNavigationKey !== nextOpportunityNavigationKey){
+		console.log("CurrentRMS Helper: opportunity view changed without a full page load; reloading to reset extension state.");
+		window.location.reload();
+		return;
+	}
+
+	currentOpportunityNavigationKey = nextOpportunityNavigationKey;
+}, 250);
 
 
 if (pageUrl.endsWith("view=d&scrape")){
@@ -161,6 +211,8 @@ if (pageUrl.endsWith("view=d&scrape")){
 
 
 	chrome.runtime.sendMessage({ action: "closeTab" });
+} else if (pageUrl.endsWith("crossscanning=true")){
+	executeCrossScan();
 }
 
 
@@ -201,14 +253,72 @@ function createBlockOutOverlay() {
 
 
 const exists = sel => document.querySelector(sel) !== null;
+const missingElementLogs = new Set();
+const logMissingElement = (feature, selector) => {
+	const key = `${feature}:${selector}`;
+	if (!missingElementLogs.has(key)){
+		missingElementLogs.add(key);
+		console.warn(`CurrentRMS Helper: ${feature} missing expected element: ${selector}`);
+	}
+};
+const clickIfPresent = (id, feature = "click action") => {
+	const element = document.getElementById(id);
+	if (element){
+		element.click();
+	} else {
+		logMissingElement(feature, `#${id}`);
+	}
+};
+const waitForElement = (selector, timeout = 10000, root = document.documentElement) => {
+	return new Promise((resolve, reject) => {
+		const existing = document.querySelector(selector);
+		if (existing){
+			resolve(existing);
+			return;
+		}
+
+		const observer = new MutationObserver(() => {
+			const element = document.querySelector(selector);
+			if (element){
+				clearTimeout(timer);
+				observer.disconnect();
+				resolve(element);
+			}
+		});
+
+		const timer = setTimeout(() => {
+			observer.disconnect();
+			reject(new Error(`Timed out waiting for ${selector}`));
+		}, timeout);
+
+		observer.observe(root, { childList: true, subtree: true });
+	});
+};
+const waitForOptionalElement = async (selector, feature, timeout = 10000) => {
+	try {
+		return await waitForElement(selector, timeout);
+	} catch (err) {
+		logMissingElement(feature, selector);
+		return null;
+	}
+};
 
 // Detect views
-orderView          = exists('div.row.sticky.quick-add-section');
-detailView         = exists('#quick_prepare.tab-pane');
+const opportunityShowPath = /^\/opportunities\/\d+\/?$/.test(window.location.pathname);
+const opportunityViewParam = new URLSearchParams(window.location.search).get("view");
+const domOrderView = exists('div.row.sticky.quick-add-section');
+const domDetailView = exists('#quick_prepare.tab-pane');
+
 editOppView        = exists('form.simple_form.edit_opportunity, form.simple_form.new_opportunity');
 editContainerView  = document.getElementById('container_mode_div') !== null; // ID lookup is fastest
 globalCheckinView  = exists('div.col-sm-12.global_check_ins.main-content');
 globalSearchView   = exists('div.global-search-summary');
+const otherKnownView = editOppView || editContainerView || globalCheckinView || globalSearchView;
+const explicitOrderView = opportunityShowPath && (!opportunityViewParam || opportunityViewParam === "o");
+const explicitDetailView = opportunityShowPath && opportunityViewParam === "d";
+
+orderView          = !otherKnownView && (domOrderView || explicitOrderView);
+detailView         = !otherKnownView && !orderView && (explicitDetailView || (domDetailView && opportunityShowPath && opportunityViewParam !== "o" && opportunityViewParam !== "c"));
 
 // Lazy-load transfer out module.
 if (detailView) {
@@ -222,70 +332,78 @@ if (detailView) {
 }
 
 
+console.log("CurrentRMS Helper view detection:", {
+	orderView,
+	detailView,
+	domOrderView,
+	domDetailView,
+	opportunityShowPath,
+	opportunityViewParam,
+	explicitOrderView,
+	explicitDetailView,
+	otherKnownView,
+	editOppView,
+	editContainerView,
+	globalCheckinView,
+	globalSearchView
+});
 
 
 if (orderView){
 	console.log("Order view: "+orderView);
-}
-
-if (detailView){
+} else if (detailView){
 	console.log("Detail view: "+detailView);
-}
-
-if (editOppView){
+} else if (editOppView){
 	console.log("Edit Opportunity View: "+editOppView);
-}
-
-if (globalCheckinView){
+} else if (globalCheckinView){
 	console.log("Global Check-in view: "+globalCheckinView);
-}
-
-if (editContainerView){
+} else if (editContainerView){
 	console.log("Edit container view: "+editContainerView);
+} else {
+	console.log("No view detected");
 }
 
 
 // Code chunk to enable auto-scrolling to last position in Order or Detail View.
-if (detailView){
-
+function restoreSavedDetailFilters(){
 	var currentView = "detail";
 	
 	chrome.storage.local.get(["last-scroll"]).then((result) => {
-			if (result){
+			if (result && result["last-scroll"]){
 				console.log(result);
 				if (result["last-scroll"].opp == opportunityID && result["last-scroll"].view == currentView){
 					console.log("Reloading filters!");
 
 					if (result["last-scroll"].notesHidden == true){
-						document.getElementById("notes-button").click();
+						clickIfPresent("notes-button", "saved filters");
 					}
 
 					if (result["last-scroll"].preparedHidden == true){
-						document.getElementById("prepared-button").click();
+						clickIfPresent("prepared-button", "saved filters");
 					}
 
 					if (result["last-scroll"].bookedOutHidden == true){
-						document.getElementById("booked-out-button").click();
+						clickIfPresent("booked-out-button", "saved filters");
 					}
 
 					if (result["last-scroll"].checkedInHidden == true){
-						document.getElementById("checked-in-button").click();
+						clickIfPresent("checked-in-button", "saved filters");
 					}
 
 					if (result["last-scroll"].bulkOnly == true){
-						document.getElementById("bulk-button").click();
+						clickIfPresent("bulk-button", "saved filters");
 					}
 
 					if (result["last-scroll"].subhiresHidden == true){
-						document.getElementById("subhires-button").click();
+						clickIfPresent("subhires-button", "saved filters");
 					}
 
 					if (result["last-scroll"].nonsubsHidden == true){
-						document.getElementById("nonsubs-button").click();
+						clickIfPresent("nonsubs-button", "saved filters");
 					}
 
 					if (result["last-scroll"].nonShortsHidden == true){
-						document.getElementById("nonshorts-button").click();
+						clickIfPresent("nonshorts-button", "saved filters");
 					}
 
 				} else {
@@ -293,20 +411,15 @@ if (detailView){
 				}
 			}
 	});
-
-	// Save scroll position on click
-	document.addEventListener('click', () => {
-
-			var currentView = "detail";
-			
-			chrome.storage.local.set({ 'last-scroll': {opp: opportunityID, view: currentView, notesHidden: notesHidden, preparedHidden: preparedHidden, bookedOutHidden: bookedOutHidden, checkedInHidden:checkedInHidden, bulkOnly: bulkOnly, subhiresHidden: subhiresHidden, nonsubsHidden: nonsubsHidden, nonShortsHidden: nonShortsHidden} }).then(() => {
-				 console.log("Saved filters updated");
-			});
-	});
-
 }
 
-
+// Save scroll position on click
+function saveFilters() {
+	var currentView = "detail";
+	chrome.storage.local.set({ 'last-scroll': {opp: opportunityID, view: currentView, notesHidden: notesHidden, preparedHidden: preparedHidden, bookedOutHidden: bookedOutHidden, checkedInHidden:checkedInHidden, bulkOnly: bulkOnly, subhiresHidden: subhiresHidden, nonsubsHidden: nonsubsHidden, nonShortsHidden: nonShortsHidden} }).then(() => {
+		 console.log("Saved filters updated");
+	});
+};
 
 
 
@@ -331,6 +444,7 @@ if (detailView || orderView || globalCheckinView){
 	// Create event listener to close the modal if clicked
 	modalElement.addEventListener('click', function() {
 			modalElement.style.display = "none";
+			focusInput();
 	});
 }
 
@@ -400,7 +514,11 @@ chrome.storage.local.get(["detailDelete"]).then((result) => {
 		console.log("Disable Detail View Delete setting: "+detailDelete);
 
 		if (detailView){
-			hideDeleteButtons();
+			waitForOptionalElement("#opportunity_item_assets_body", "hide delete buttons", 15000).then((assetList) => {
+				if (assetList){
+					hideDeleteButtons();
+				}
+			});
 		}
 });
 
@@ -417,6 +535,23 @@ chrome.storage.local.get(["nestedTotals"]).then((result) => {
 		nestedTotals = result.nestedTotals;
 	}
 	console.log("Show Collapsed Item Totals setting: "+nestedTotals);
+
+
+});
+
+// get the containerCheck setting from local storage
+chrome.storage.local.get(["containerCheck"]).then((result) => {
+	if (result.containerCheck == undefined){
+		containerCheck = true;
+
+	} else if (result.containerCheck == "false"){
+		containerCheck = false;
+	} else if (result.containerCheck == "true"){
+		containerCheck = true;
+	} else {
+		containerCheck = result.containerCheck;
+	}
+	console.log("Container check setting: "+containerCheck);
 
 
 });
@@ -577,6 +712,7 @@ if (detailView || orderView || globalCheckinView){
 				containerDataList = result.containerList;
 				console.log("Retrieved containerDataList from storage:");
 				console.log(containerDataList);
+				console.log(typeof containerDataList);
 			}
 	});
 
@@ -585,7 +721,16 @@ if (detailView || orderView || globalCheckinView){
 		if (result.containerData != undefined){
 			containerData = result.containerData;
 			console.log("Retrieved containerData from storage:");
-			console.log(containerData);
+			//console.log(containerData);
+		}
+	});
+
+	// load the containerItems from local storage
+	chrome.storage.local.get(["containerItems"]).then((result) => {
+		if (result.containerItems != undefined){
+			containerItems = new Set(result.containerItems || []);
+			console.log("Retrieved containerItems from storage:");
+			console.log(containerItems);
 		}
 	});
 	
@@ -593,118 +738,150 @@ if (detailView || orderView || globalCheckinView){
 };
 
 if (editContainerView){
+	
 	// Load the stock item list from local storage
 	chrome.storage.local.get(["allStock"]).then((result) => {
-			if (result.allStock == undefined){
-				// If the variable is empty, it might not have been got yet (first use)
-				console.log("Stock list was not found. Requesting refresh.");
-				chrome.runtime.sendMessage("refreshProducts");
-			} else {
-				const allStockString = result.allStock;
-				// Parse the JSON string back into an object
-				allStock = JSON.parse(allStockString);
-				console.log("Retrieved allStock from storage:");
-				//console.log(allStock.stock_levels);
-				chrome.storage.local.get(["api-details"]).then((result) => {
-						if (result["api-details"].apiKey && result["api-details"].apiSubdomain){
-							apiKey = result["api-details"].apiKey;
-							apiSubdomain = result["api-details"].apiSubdomain;
-						} else {
-							console.log("API details have not been found.");
-							//makeToast("toast-info", "API details have not found.", 5);
-						}
-				});
-				console.log(allStock);
-
-				let thisContainerWeight = 0;
-				let thisContainerSelfWeight = 0;
-				let thisContainerTotalWeight = 0;
-
-				const containerID = document.querySelector("div.subtitle").innerText.trim();
-
-				if (containerID){
-					const thisContainer = allStock.stock_levels.find(item => item.asset_number === containerID);
-					if (thisContainer){
-						thisContainerSelfWeight = parseFloat(thisContainer.item.weight);
-						thisContainerSelfWeight = Math.round(thisContainerSelfWeight * 100) / 100;
+		if (result.allStock == undefined){
+			// If the variable is empty, it might not have been got yet (first use)
+			console.log("Stock list was not found. Requesting refresh.");
+			chrome.runtime.sendMessage("refreshProducts");
+		} else {
+			const allStockString = result.allStock;
+			// Parse the JSON string back into an object
+			allStock = JSON.parse(allStockString);
+			console.log("Retrieved allStock from storage:");
+			//console.log(allStock.stock_levels);
+			chrome.storage.local.get(["api-details"]).then((result) => {
+					if (result["api-details"].apiKey && result["api-details"].apiSubdomain){
+						apiKey = result["api-details"].apiKey;
+						apiSubdomain = result["api-details"].apiSubdomain;
+					} else {
+						console.log("API details have not been found.");
+						//makeToast("toast-info", "API details have not found.", 5);
 					}
-				}
-
-
-
-
-
-				const serialisedComponentsBody = document.getElementById('serialised_components_body');
-				if (serialisedComponentsBody){
-					const serialisedComponentRows = serialisedComponentsBody.querySelectorAll('tr');
-					serialisedComponentRows.forEach((row, i) => {
-						const assetNumber = row.querySelector('td.essential').innerText.trim();
-						const thisItem = allStock.stock_levels.find(item => item.asset_number === assetNumber);
-						if (thisItem){
-							const thisWeight = thisItem.item.weight;
-							if (thisWeight && thisWeight != null){
-								thisContainerWeight = thisContainerWeight + parseFloat(thisWeight);
-							}
-						}
-						
-					});
-					// rounding to fix float issues
-					thisContainerWeight = Math.round(thisContainerWeight * 100) / 100;
-
-					thisContainerTotalWeight = Math.round((thisContainerWeight + thisContainerSelfWeight) * 100) / 100;
-
-
-					console.log("Container weight: "+thisContainerWeight);
-					console.log("Container self weight: "+thisContainerSelfWeight);
-					console.log("Total weight: "+thisContainerTotalWeight);
-
-					// add info to the side bar
-					const attributeList = document.querySelector("ul.number-list");
-					const newHtml = `
-					<li><span>Container Total Weight: ${thisContainerTotalWeight} ${weightUnit}</span></li>
-					<li><span><i>&#8627; Container Contents: ${thisContainerWeight} ${weightUnit}</i></span></li>
-					<li><span><i>&#8627; Container Item: ${thisContainerSelfWeight} ${weightUnit}</i></span></li>
-					`;
-					attributeList.insertAdjacentHTML('beforeend', newHtml);
-
-
-				}
-
-
-			}
-	});
-
-
-	// work out which container we're editing
-	const containerSection = document.querySelector("div.content.detailspage.row.serialised_containers");
-	if (containerSection){
-		containerUnderEdit = containerSection.querySelector("div.subtitle").innerText.trim();
-		console.log(containerUnderEdit);
-	}
-
-	// start monitoring the scan box
-	var scanComponentBox = document.getElementById('component_stock_level_asset_number');
-
-	scanComponentBox.addEventListener("keypress", function(event) {
-		if (event.key === "Enter") {
-
-			var myScan = scanComponentBox.value;
-
-			if (myScan == containerUnderEdit){
-				// we have scanned the container, so we should go back to the list
-				event.preventDefault();
-				containerScanSound();
-				const backButton = document.querySelector("i.icn-cobra-goback");
-				setTimeout(function () {
-					backButton.click();
-				}, 250);
-			}
+			});
 		}
+	
+
+	// Load the all products list from local storage
+	chrome.storage.local.get(["allProducts"]).then((result) => {
+		if (result.allProducts == undefined){
+			// If the variable is empty, it might not have been got yet (first use)
+			chrome.storage.local.get(["api-details"]).then((result) => {
+				const details = result["api-details"];
+				if (details && details.apiKey && details.apiSubdomain){
+					console.log("Products list was not found. Requesting refresh.");
+					makeToast("toast-info", "Products list was not found. Requesting refresh.", 5);
+					chrome.runtime.sendMessage("refreshProducts");
+				} else {
+					console.log("API details have not been found in local storage.");
+					//makeToast("toast-info", "API details have not found.", 5);
+				}
+			});
+		} else {
+			const allProductsString = result.allProducts;
+			// Parse the JSON string back into an object
+			allProducts = JSON.parse(allProductsString);
+			console.log("Retrieved allProducts from storage.");
+			//console.log(allProducts.products);
+		}
+			//console.log("Global check-in overide: "+multiGlobal);
+
+
+		containerEditAddWeightData();
+				
+				
+
+			// work out which container we're editing
+			const containerSection = document.querySelector("div.content.detailspage.row.serialised_containers");
+			if (containerSection){
+				containerUnderEdit = containerSection.querySelector("div.subtitle").innerText.trim();
+				console.log(containerUnderEdit);
+			}
+
+
+			function containerActiveIntercept(){
+				// start monitoring the scan box
+				console.log("CONTAINER INTERCEPT RUNNING");
+				var scanComponentBox = document.getElementById('component_stock_level_asset_number');
+				var scanComponentQuantityBox = document.getElementById("quantity");
+				var scanComponentBoxParentSpan = scanComponentBox.parentNode;
+
+				function resetContainerScanBox(){
+					// block to clear the allocate and book out boxes after an intercept
+					scanComponentBox.value = '';
+					scanComponentQuantityBox.value = "1";
+					scanComponentBoxParentSpan = scanComponentBox.parentNode;
+					var htmlFudge = scanComponentBoxParentSpan.innerHTML;
+					scanComponentBoxParentSpan.innerHTML = htmlFudge;
+					scanComponentBox = document.getElementById('component_stock_level_asset_number');
+
+					const suggestionBoxes = document.querySelectorAll(".tt-dropdown-menu");
+					suggestionBoxes.forEach((item, i) => {
+							item.remove();
+					});
+
+
+
+					setTimeout(scanComponentBox.focus(), 100); // delayed to avoid the jQuery function messing it up
+					containerActiveIntercept(); // need to re-run because we've just nuked the scan section DOM so the event listener won't work
+				}
+
+
+				scanComponentBox.addEventListener("keypress", function(event) {
+					if (event.key === "Enter") {
+
+						var myScan = scanComponentBox.value;
+
+						if (myScan == containerUnderEdit){
+							// we have scanned the container, so we should go back to the list
+							event.preventDefault();
+							containerScanSound();
+							const backButton = document.querySelector("i.icn-cobra-goback");
+							setTimeout(function () {
+								backButton.click();
+							}, 250);
+						} else if (myScan.toLowerCase() == "test"){
+							// test
+							containerScanSound();
+							sayWord("test container scan");
+							resetContainerScanBox();
+							event.preventDefault();
+
+						} else if (myScan.charAt(0) === '%'){
+							// this is a special scan of a bulk barcode that includes a Quantity
+
+							// Define a regular expression to match the pattern "%{integer}%{rest-of-the-string}"
+							const regex = /^%(\d+)%(.+)$/;
+							// Use the exec() method to extract matches
+							const matches = regex.exec(myScan);
+
+							if (matches) {
+									// matches[1] contains the bulkQuantity, matches[2] contains the bulkAsset
+									const bulkQuantity = parseInt(matches[1], 10);
+
+									if (!isNaN(bulkQuantity)) {
+											// Check if bulkQuantity is a valid integer
+											const bulkAsset = matches[2];
+											scanComponentQuantityBox.value = bulkQuantity;
+											scanComponentBox.value = bulkAsset;
+											console.log("bulkQuantity:", bulkQuantity);
+											console.log("bulkAsset:", bulkAsset);
+									} else {
+											console.log("Invalid bulkQuantity. It must be an integer.");
+									}
+							} else {
+									console.log("String does not match the expected pattern.");
+							}
+
+						}
+					}
+				});
+			}
+			containerActiveIntercept();
+			enableContainerGhosting();
+		});
 	});
-
-
-
-
 }
 
 
@@ -1274,24 +1451,41 @@ async function addDetails(mode) {
 			console.log("Running offline addDetails");
 		}
 
-		console.log("oppData:");
-		console.log(oppData);
+			console.log("oppData:");
+			console.log(oppData);
 
-		// Find all elements with class "optional-01 asset asset-column"
-		var assetColumns = document.querySelectorAll('td.optional-01.asset.asset-column');
+				await waitForOptionalElement("#opportunity_item_assets_body", "addDetails asset list", 15000);
+
+				// Find all elements with class "optional-01 asset asset-column"
+				var assetColumns = document.querySelectorAll('td.optional-01.asset.asset-column');
+			if (assetColumns.length === 0){
+				logMissingElement("addDetails product rows", "td.optional-01.asset.asset-column");
+			}
 
 		var notedOppAssetIds = [];
 		var thisDescription = "";
 
 	
-		for (var i = 0; i < assetColumns.length; i++) {
-			var parentRow = assetColumns[i].closest('tr');
-			var oppItemId = parentRow.getAttribute("data-oi-id");
-			var parentTableBody = assetColumns[i].closest('tbody');
-			var nameElement = parentRow.querySelector('.essential.asset.dd-name');
-			var nameDiv = nameElement.querySelector('div:last-child');
-			// Find the span with class 'product-tip' within nameDiv
-			var productTip = nameDiv.querySelector('span.product-tip');
+			for (var i = 0; i < assetColumns.length; i++) {
+				var parentRow = assetColumns[i].closest('tr');
+				if (!parentRow){
+					logMissingElement("addDetails product rows", "closest tr from td.optional-01.asset.asset-column");
+					continue;
+				}
+				var oppItemId = parentRow.getAttribute("data-oi-id");
+				var parentTableBody = assetColumns[i].closest('tbody');
+				var nameElement = parentRow.querySelector('.essential.asset.dd-name');
+				if (!nameElement){
+					logMissingElement("addDetails product rows", ".essential.asset.dd-name");
+					continue;
+				}
+				var nameDiv = nameElement.querySelector('div:last-child');
+				if (!nameDiv){
+					logMissingElement("addDetails product rows", ".essential.asset.dd-name div:last-child");
+					nameDiv = nameElement;
+				}
+				// Find the span with class 'product-tip' within nameDiv
+				var productTip = nameDiv.querySelector('span.product-tip');
 			// If the element exists, remove it
 			if (productTip) {
 					productTip.remove();
@@ -1309,10 +1503,11 @@ async function addDetails(mode) {
 						prodName = prodName.slice("Expand\n".length);
 					}
 
-					// find the closest <a>
-					const closestLink = nameElement.querySelector('a').href;
-					let linkId = 0;
-					const lastSlash = closestLink.lastIndexOf('/');
+						// find the closest <a>
+						const closestLinkElement = nameElement.querySelector('a');
+						const closestLink = closestLinkElement ? closestLinkElement.href : "";
+						let linkId = 0;
+						const lastSlash = closestLink.lastIndexOf('/');
 					const firstQuestion = closestLink.indexOf('?', lastSlash + 1); // search *after* the last “/”
 
 					// Guard against edge‑cases
@@ -1350,9 +1545,13 @@ async function addDetails(mode) {
 			}
 
 
-			if (thisDescription && !notedOppAssetIds.includes(oppItemId)){
-				notedOppAssetIds.push(oppItemId);
-				// add item description/note section
+				if (thisDescription && !notedOppAssetIds.includes(oppItemId)){
+					if (!parentTableBody){
+						logMissingElement("addDetails item descriptions", "closest tbody from td.optional-01.asset.asset-column");
+						continue;
+					}
+					notedOppAssetIds.push(oppItemId);
+					// add item description/note section
 				const numberOfPadElemenets = parentRow.getElementsByClassName("essential padding-column");
 
 				// Count the number of matching elements
@@ -1431,10 +1630,14 @@ async function addDetails(mode) {
 		const tableFunctionsHeader = document.querySelector('div.row.sticky.quick-function-section');
 
 		if (tableFunctionsHeader) {
-				const helperButtonRow = document.querySelector('div.row.helper-sticky');
 				const observer = new MutationObserver(function(mutations) {
 						mutations.forEach(function(mutation) {
 								if (mutation.target === tableFunctionsHeader) {
+										const helperButtonRow = document.querySelector('div.row.helper-sticky');
+										if (!helperButtonRow) {
+											return;
+										}
+
 										// Your logic for handling changes to tableFunctionsHeader
 										const topValue = tableFunctionsHeader.style.top; // Get the current 'top' style value
 										console.log('Top style value changed:', topValue);
@@ -1463,11 +1666,13 @@ async function addDetails(mode) {
 
 
 
-	} else if (orderView){
-		console.log("add Details order view");
+		} else if (orderView){
+			console.log("add Details order view");
 
-		// Find empty descriptions and remove them
-		const allEditableDescs = document.querySelectorAll('div.editable.opportunity-item-description');
+			await waitForOptionalElement("#opportunity_items_body, #opportunity_items_scrollable", "order addDetails item list", 15000);
+
+			// Find empty descriptions and remove them
+			const allEditableDescs = document.querySelectorAll('div.editable.opportunity-item-description');
 		const emptyDescs = Array.from(allEditableDescs)
 		.filter(el => el.innerText === '');
 		// remove any empty descriptions
@@ -1477,9 +1682,13 @@ async function addDetails(mode) {
 	
 
 
-		// get the start date and time
-		const thisSidebar = document.getElementById("sidebar_content");
-		const spans = thisSidebar.querySelectorAll('span');
+			// get the start date and time
+			const thisSidebar = await waitForOptionalElement("#sidebar_content", "order addDetails sidebar", 15000);
+			if (!thisSidebar){
+				addDetailsRunning = false;
+				return;
+			}
+			const spans = thisSidebar.querySelectorAll('span');
 		// Iterate over each <span>
 		let startDateValue = null;
 		let endDateValue = null;
@@ -2260,7 +2469,6 @@ function recallApiDetails(){
 function quarantineApiCall(){
 	return new Promise(function (resolve, reject) {
 
-		//const apiUrl = 'https://api.current-rms.com/api/v1/opportunities/'+opp+'/opportunity_items?page='+pageNumber+'&q[description_present]=1&per_page=100';
 		const apiUrl = 'https://api.current-rms.com/api/v1/quarantines?page='+pageNumber+'&per_page=100&q[quarantine_type_not_eq]=3';
 		// Options for the fetch request
 		const fetchOptions = {
@@ -2686,6 +2894,7 @@ function notesButton(){
 		element.classList.add("strike-through");
 		//element.innerHTML = "Notes Hidden";
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -2735,6 +2944,7 @@ function preparedButton(){
 		element.classList.add("strike-through");
 		//element.innerHTML = "Prepared Hidden";
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -2822,6 +3032,7 @@ function bookedOutButton(){
 		element.classList.add("strike-through");
 		element.innerHTML = "Booked Out";
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -2911,6 +3122,7 @@ function checkedInButton(){
 		element.classList.add("strike-through");
 		//element.innerHTML = "Checked In";
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -2995,6 +3207,7 @@ function bulkButton(){
 		element.classList.add("turned-on");
 		element.innerHTML = "Bulk Only";
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -3104,6 +3317,7 @@ function subhiresButton(){
 		element.classList.add("strike-through");
 		//element.innerHTML = "Sub-Rents Hidden";
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -3183,6 +3397,7 @@ function nonsubsButton(){
 		element.innerHTML = "Sub-Rents Only";
 		console.log("hiding non subs");
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -3286,6 +3501,7 @@ function nonShortsButton(){
 		element.innerHTML = "Shorts Only";
 		console.log("hiding non shorts");
 	}
+	saveFilters();
 	focusInput();
 }
 
@@ -3809,15 +4025,14 @@ const observer = new MutationObserver((mutations) => {
 		} else if (scanningContainer && (messageText.includes('Allocation successful')  || messageText.includes('Items successfully marked as prepared'))){
 				scanSound();
 				addDetails(true);
-
-				if (smartScan){
-					console.log("Running smartScanSetup");
-					smartScanSetup(lastScan);
-				}
-
+				console.log("Running smartScanSetup on container asset");
+				smartScanTarget = lastScan;
+				
 				// set the container field to the new asset
 				containerBox = document.querySelector('input[type="text"][name="container"]');
 				containerBox.value = scanningContainer;
+
+				smartScanSetup(smartScanTarget);
 
 				// restore freeScan to where it was.
 				setFreeScan(freeScanReset);
@@ -3860,6 +4075,22 @@ const observer = new MutationObserver((mutations) => {
 							wrongItem = theAsset;
 							setTimeout(function() {
 								sayWord("Already scanned");
+								console.log(messageText);
+							}, 900);
+						}
+					} else if (containerItems.has(theAsset)){
+						// Means it's a containerised asset
+						if (theAsset == wrongItem){
+							// second scan of same item
+							theAsset = extractAssetToSay(messageText);
+							setTimeout(function() {
+								sayWord("Asset " + theAsset + "is containerised");
+								console.log(messageText);
+							}, 900);
+						} else {
+							wrongItem = theAsset;
+							setTimeout(function() {
+								sayWord("Containerised asset");
 								console.log(messageText);
 							}, 900);
 						}
@@ -3974,7 +4205,7 @@ const observer = new MutationObserver((mutations) => {
 			}, 900);
 			destroyAfterTime(toastMessage, errorTimeout);
 
-		}else if (messageText.slice(11) == 'None of the selected stock allocations are allocated or reserved.'){
+		} else if (messageText.slice(11) == 'None of the selected stock allocations are allocated or reserved.'){
 					setTimeout(function() {
 						sayWord("Cannot prepare item.");
 						console.log(messageText);
@@ -3982,7 +4213,7 @@ const observer = new MutationObserver((mutations) => {
 		destroyAfterTime(toastMessage, errorTimeout);
 
 		// Handle an error during global check-in that is caused by a failed scan
-		}else if (messageText.includes("at your active store using the filter options from the settings screen (accessed using the wrench button).")){
+		} else if (messageText.includes("at your active store using the filter options from the settings screen (accessed using the wrench button).")){
 
 					console.log(messageText);
 
@@ -4067,6 +4298,13 @@ const observer = new MutationObserver((mutations) => {
 			destroyAfterTime(toastMessage, errorTimeout);
 
 
+				// Error sound and warning if scan into container is blocked because of quarantine
+			} else if (messageText.includes('can not become a container component while it has an active quarantine.')){
+				setTimeout(function() {
+					sayWord("Quarantined asset.");
+				}, 800);
+
+
 
 			// handle the user hitting enter on an empty input box
 			} else if (messageText.includes("You must select an asset.")) {
@@ -4076,7 +4314,7 @@ const observer = new MutationObserver((mutations) => {
 				}
 				destroyAfterTime(toastMessage, errorTimeout);
 
-				// handle the user hitting enter on an empty input box
+				// out of scope item
 			} else if (messageText.includes("The stock level's product does not match the stock check product.")) {
 				// Normally redundant except global check in doesn't do error boxes.
 				setTimeout(function() {
@@ -4089,28 +4327,71 @@ const observer = new MutationObserver((mutations) => {
 				// Normally redundant except global check in doesn't do error boxes.
 				scanSound();
 
+			} else if (messageText.includes('Container component was successfully added') ||
+			messageText.includes('Container component was successfully removed')) {
+				// Only used in serialised container view
+				scanSound();
+				enableContainerGhosting();
+				containerEditAddWeightData(); // recalculate weights
+				
+
 			// Handle myriad messages that are good, and just need a confirmatory "ding"
-			} else if (messageText.includes('Allocation successful') || messageText.includes('Items successfully marked as prepared') || messageText.includes('Items successfully checked in') || messageText.includes('Container Component was successfully destroyed.') || messageText.includes('Opportunity Item was successfully destroyed.') || messageText.includes('Container component was successfully added') || messageText.includes('Opportunity Item was successfully updated.')  ||  messageText.includes('Items successfully booked out') || messageText.includes('Container component was successfully removed')  || messageText.includes('Check-in details updated successfully') || messageText.includes('Opportunity Item was updated.') || messageText.includes('Set container successfully') || messageText.includes('Asset(s) successfully checked in')){
+			} else if (messageText.includes('Allocation successful') ||
+			messageText.includes('Items successfully marked as prepared') ||
+			messageText.includes('Items successfully checked in') ||
+			messageText.includes('Container Component was successfully destroyed.') ||
+			messageText.includes('Opportunity Item was successfully destroyed.') ||
+			
+			messageText.includes('Opportunity Item was successfully updated.')  ||
+			messageText.includes('Items successfully booked out') ||
+			
+			messageText.includes('Check-in details updated successfully') ||
+			messageText.includes('Opportunity Item was updated.') ||
+			messageText.includes('Set container successfully') ||
+			messageText.includes('Asset(s) successfully checked in')){
 				addDetails(true);
-				if (detailView && (document.querySelector('input[type="text"][name="container"]').value)){
+				const containerInput = detailView ? document.querySelector('input[type="text"][name="container"]') : null;
+				if (containerInput && containerInput.value){
 					containerScanSound();
+				
 				} else if (!orderView){
 					scanSound();
 				}
 
 				if (messageText.includes('Allocation successful')){
-					if (detailView && smartScan){
-						console.log("Running smartScanSetup");
-						smartScanSetup(lastScan);
+					if (detailView){
+						
+						if (smartScanCandidates && Object.prototype.hasOwnProperty.call(
+							smartScanCandidates,
+							lastScan.trim()
+						  )) {
+							console.log("Successful smart scan compelted");
+							delete smartScanCandidates[lastScan];
+							smartScanCandidateLines--;
+
+							if (smartScanCandidateLines == 0){
+								setTimeout(() => sayWord("Complete."), 400);
+							} else {
+								smartScanSetup(smartScanTarget);
+							}
+
+
+						} else {	
+							console.log("Running smartScanSetup");
+							smartScanTarget = lastScan;
+							smartScanSetup(smartScanTarget);
+						}
 					}
 				}
+
+
+
+
 
 			} else if (messageText.includes('Helper failed to fetch from API. Retrying.')){
 				// do nothing
 				console.log("Re-trying to fetch from API");
 			
-
-
 
 			// If any other alert appears, log it so that I can spot it and add it to this code
 			} else {
@@ -4357,12 +4638,17 @@ function newCalculateContainerWeights() {
 		if (subhireWeightLi){
 			subhireWeightLi.innerHTML = `${subhireWeight} ${weightUnit}`;
 			stockWeightLi.innerHTML = `${stockWeight} ${weightUnit}`;
-		} else {
-			// Find the <li> element that contains the weight
-			var weightLi = document.querySelector('#weight_total').closest('li');
+			} else {
+				// Find the <li> element that contains the weight
+				var weightTotalElement = document.querySelector('#weight_total');
+				var weightLi = weightTotalElement ? weightTotalElement.closest('li') : null;
+				if (!weightLi || !weightLi.parentNode){
+					logMissingElement("order weights", "#weight_total li");
+					return;
+				}
 
-			// Create a new <li> element
-			var subLi = document.createElement('li');
+				// Create a new <li> element
+				var subLi = document.createElement('li');
 			subLi.innerHTML = `<span>&#8627; Sub-Rent Weight:</span>
 												 <span id="subhire_weight";>
 												 ${subhireWeight} ${weightUnit}
@@ -4454,44 +4740,46 @@ listToastPosts();
 
 // add a section to the sidebar if it exists
 if (detailView){
-	try {
-	  var containerWeightsSection = document.getElementById("sidebar_content");
-	 
-	  if (containerWeightsSection) {
-	    var htmlContent = `<div class='group-side-content' id='containerWeightsSection'><h3>Container Weights<a class='toggle-button expand-arrow icn-cobra-contract' href='#'></a></h3><div><ul id='containerlist' style='display: block;'></ul></div></div>`;
-	 
-	    containerWeightsSection.insertAdjacentHTML("afterend", htmlContent);
-	 
-	    var containerWeightsSectionDiv = document.getElementById('containerWeightsSection');
-	    var toggleButton = containerWeightsSectionDiv.querySelector('.toggle-button');
-	 
-	    // Adjust the display property for the initial state
-	    var containerListElement = document.getElementById('containerlist');
-	    containerListElement.style.display = 'block';
-	 
-	    toggleButton.onclick = function (event) {
-	      event.preventDefault();
-	      if (containerListElement.style.display === 'none' || containerListElement.style.display === '') {
-	        containerListElement.style.display = 'block';
-	        toggleButton.classList.remove('icn-cobra-expand');
-	        toggleButton.classList.add('icn-cobra-contract');
-	      } else {
-	        containerListElement.style.display = 'none';
-	        toggleButton.classList.remove('icn-cobra-contract');
-	        toggleButton.classList.add('icn-cobra-expand');
-	      }
-	    };
-	 
-	    getWeightUnit(); // check to see what weight unit the user has set by looking at the total weight field
-			newCalculateContainerWeights(); // set initial container weigh values in the side bar
-	 
-	    // Add inline style for the toggle-button size
-	    toggleButton.style.fontSize = '14px'; // Adjust the size as needed
-	  }
-	} catch (err) {
-	  console.error(err);
-	}
+	initialiseDetailContainerWeightsSection();
+}
 
+async function initialiseDetailContainerWeightsSection(){
+	try {
+		var containerWeightsSection = await waitForOptionalElement("#sidebar_content", "container weights section", 15000);
+		if (containerWeightsSection) {
+			var htmlContent = `<div class='group-side-content' id='containerWeightsSection'><h3>Container Weights<a class='toggle-button expand-arrow icn-cobra-contract' href='#'></a></h3><div><ul id='containerlist' style='display: block;'></ul></div></div>`;
+
+			containerWeightsSection.insertAdjacentHTML("afterend", htmlContent);
+
+			var containerWeightsSectionDiv = document.getElementById('containerWeightsSection');
+			var toggleButton = containerWeightsSectionDiv.querySelector('.toggle-button');
+
+			// Adjust the display property for the initial state
+			var containerListElement = document.getElementById('containerlist');
+			containerListElement.style.display = 'block';
+
+			toggleButton.onclick = function (event) {
+				event.preventDefault();
+				if (containerListElement.style.display === 'none' || containerListElement.style.display === '') {
+					containerListElement.style.display = 'block';
+					toggleButton.classList.remove('icn-cobra-expand');
+					toggleButton.classList.add('icn-cobra-contract');
+				} else {
+					containerListElement.style.display = 'none';
+					toggleButton.classList.remove('icn-cobra-contract');
+					toggleButton.classList.add('icn-cobra-expand');
+				}
+			};
+
+			getWeightUnit(); // check to see what weight unit the user has set by looking at the total weight field
+			newCalculateContainerWeights(); // set initial container weigh values in the side bar
+
+			// Add inline style for the toggle-button size
+			toggleButton.style.fontSize = '14px'; // Adjust the size as needed
+		}
+	} catch (err) {
+		console.error(err);
+	}
 }
 
 
@@ -4499,11 +4787,102 @@ if (detailView){
 
 // Create control Items
 if (detailView){
+	initialiseDetailControls();
+	observeDetailControlsContainer();
+} else if (orderView){
+	initialiseOrderControls();
+} else if (globalSearchView){
+
+	var searchTerm = returnGlobalSearchTerm();
+	if (searchTerm){
+		chrome.runtime.sendMessage({messageType: "globalsearchscrape", messageText: searchTerm});
+	}
+
+	const theForm = document.querySelector("form.form-search");
+		if (theForm){
+		theForm.addEventListener('submit', function(event) {
+			searchTerm = document.getElementById("search_term").value;
+			if (searchTerm.length > 0){
+					chrome.runtime.sendMessage({messageType: "globalsearchscrape", messageText: searchTerm});
+			}
+		});
+	}
+}
+
+function syncDetailFilterButtonStates(){
+	const buttonStates = [
+		{ id: "notes-button", active: notesHidden, strike: notesHidden },
+		{ id: "prepared-button", active: preparedHidden, strike: preparedHidden },
+		{ id: "booked-out-button", active: bookedOutHidden, strike: bookedOutHidden },
+		{ id: "checked-in-button", active: checkedInHidden, strike: checkedInHidden },
+		{ id: "bulk-button", active: bulkOnly, strike: false },
+		{ id: "subhires-button", active: subhiresHidden, strike: subhiresHidden },
+		{ id: "nonsubs-button", active: nonsubsHidden, strike: false },
+		{ id: "nonshorts-button", active: nonShortsHidden, strike: false }
+	];
+
+	buttonStates.forEach((buttonState) => {
+		const button = document.getElementById(buttonState.id);
+		if (!button){
+			return;
+		}
+		button.classList.toggle("turned-on", buttonState.active);
+		button.classList.toggle("strike-through", buttonState.strike);
+	});
+}
+
+function scheduleDetailControlsReadd(){
+	if (detailControlsAddScheduled){
+		return;
+	}
+	detailControlsAddScheduled = true;
+	setTimeout(() => {
+		detailControlsAddScheduled = false;
+		initialiseDetailControls(false);
+	}, 100);
+}
+
+function observeDetailControlsContainer(){
+	if (detailControlsObserverStarted){
+		return;
+	}
+	detailControlsObserverStarted = true;
+
+	const observer = new MutationObserver((mutations) => {
+		for (const mutation of mutations) {
+			const changedNodes = Array.from(mutation.addedNodes).concat(Array.from(mutation.removedNodes));
+			const controlsChanged = changedNodes.some((node) => {
+				if (!(node instanceof Element)){
+					return false;
+				}
+				return node.id === "opportunity_items_title" ||
+					node.id === "helper-control-panel" ||
+					node.classList.contains("helper-sticky") ||
+					node.querySelector("#opportunity_items_title, #helper-control-panel, .helper-sticky");
+			});
+
+			if (controlsChanged){
+				scheduleDetailControlsReadd();
+				return;
+			}
+		}
+	});
+
+	observer.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+async function initialiseDetailControls(restoreFilters = true){
 	try {
 
 		// start of new gui
 
-		var titleRow = document.getElementById("opportunity_items_title");
+		var titleRow = await waitForElement("#opportunity_items_title", 15000);
+		const titleParent = titleRow.parentElement;
+		const existingPanel = titleParent ? titleParent.querySelector("#helper-control-panel") : document.getElementById("helper-control-panel");
+		if (existingPanel){
+			syncDetailFilterButtonStates();
+			return;
+		}
 
 
 
@@ -4589,29 +4968,148 @@ if (detailView){
 		document.getElementById("subhires-button").addEventListener("click", subhiresButton);
 		document.getElementById("nonsubs-button").addEventListener("click", nonsubsButton);
 		document.getElementById("nonshorts-button").addEventListener("click", nonShortsButton);
+		if (restoreFilters){
+			restoreSavedDetailFilters();
+		} else {
+			syncDetailFilterButtonStates();
+			updateHidings();
+		}
+
+
+		// create a cross scan option in the function menu
+			const functionDiv = document.getElementById("functions");
+			if (functionDiv){
+				const dropDownMenu = functionDiv.querySelector("ul.dropdown-menu");
+				if (dropDownMenu && !dropDownMenu.querySelector("#crossscan-option")){
+
+				const newDivider = document.createElement('li');
+				newDivider.classList.add("divider");
+
+				//append newDivider to end of dropDownMenu
+				dropDownMenu.appendChild(newDivider);
+
+				const newOption = document.createElement('li');
+				newOption.id = "crossscan-option";
+				newOption.innerHTML = `
+				<a class="" href="">
+					Cross Scan
+				</a>`;
+
+				//append newOption to end of dropDownMenu
+				dropDownMenu.appendChild(newOption);
+
+				// Add click listener
+				const link = newOption.querySelector("a");
+				link.addEventListener("click", function (event) {
+					event.preventDefault();
+					crossScanModal1();
+				});
+			}
+		}
+
+		
+		// Find the existing Allocate button
+		const allocateButton = await waitForOptionalElement('input.btn[value="allocate"]', "smart scan setup", 15000);
+
+			if (allocateButton && !document.getElementById('smart_scan')) {
+			const ScInsertTarget = allocateButton.closest("div");
+
+			if (ScInsertTarget && ScInsertTarget.parentNode) {
+
+				// Create a new DIV element
+				const smartScanButton = document.createElement("div");
+				smartScanButton.classList.add('smart-scan-toggle', 'col-md-3', 'col-sm-3');
+			
+				// Add inner HTML
+				smartScanButton.innerHTML = `
+					<label for="smart_scan">Smart Scan</label>
+					<label class="checkbox toggle android" for="smart_scan">
+					<input name="smart_scan" type="hidden" value="0" id="smart-scan-button">
+					<input class="boolean optional" id="smart_scan" name="smart_scan" type="checkbox" value="1">
+					<p>
+						<span class="checkedtext" data-text="yes"></span>
+						<span class="uncheckedtext" data-text="no"></span>
+					</p>
+					<a class="slide-button"></a>
+					</label>
+				`;
+
+				// Insert the new div *before* the allocate button div
+				ScInsertTarget.parentNode.insertBefore(smartScanButton, ScInsertTarget);
+
+				// fix classes for the other buttons
+				const prepButton = document.getElementById('mark_as_prepared');
+				if (prepButton) {
+					const preparedDiv = prepButton.closest('div');
+					if (preparedDiv) {
+						preparedDiv.classList.remove('col-md-7', 'col-sm-7');
+						preparedDiv.classList.add('col-md-3', 'col-sm-3');
+					}
+				}
+			}
+
+			const smartScanCheckbox = document.getElementById('smart_scan');
+
+				// auto set "smart Scan" to on depending on the user setting
+				chrome.storage.local.get(["smartScan"]).then((result) => {
+					if (result.smartScan == "true"){
+						if(smartScanCheckbox && !smartScanCheckbox.checked){
+							smartScanCheckbox.click();
+						};
+					focusInput();
+				}
+			});
+
+			if (smartScanCheckbox) {
+			smartScanCheckbox.addEventListener('change', (event) => {
+				if (event.target.checked) {
+				console.log('Smart Scan turned ON');
+					smartScan = true;
+					smartScanSetup(smartScanTarget);
+				} else {
+				console.log('Smart Scan turned OFF');
+					smartScan = false;
+				}
+				console.log("smartScan:" + smartScan);
+			});
+			}
+
+			} else if (!allocateButton) {
+				console.warn('Allocate button not found!');
+			}
+
+
+
+
 
 		// end of new gui
 
 
-		document.addEventListener("dblclick", function(event) {
-			// Check if the clicked element is an <a> inside an <li> within #od-function-tabs
-			const listItem = event.target.closest("li");
-			if (listItem && listItem.classList.contains("active")) {
-					// Scroll the window to the top only if the <li> has the "active" class
-					window.scrollTo({ top: 0, behavior: "smooth" });
+			if (!detailControlsDblClickBound){
+				detailControlsDblClickBound = true;
+				document.addEventListener("dblclick", function(event) {
+					// Check if the clicked element is an <a> inside an <li> within #od-function-tabs
+					const listItem = event.target.closest("li");
+					if (listItem && listItem.classList.contains("active")) {
+							// Scroll the window to the top only if the <li> has the "active" class
+							window.scrollTo({ top: 0, behavior: "smooth" });
+							focusInput();
+					}
+				});
 			}
-		});
 
 
-	} catch (err){
-		console.log(err);
-	}
-} else if (orderView){
+		} catch (err){
+			console.log(err);
+		}
+}
+
+async function initialiseOrderControls(){
 	try {
 
 		// start of new gui
 
-		var titleRow = document.getElementById("opportunity_items_title");
+		var titleRow = await waitForElement("#opportunity_items_title", 15000);
 
 		// Create a new row element
 		let newElement = document.createElement('div');
@@ -4644,33 +5142,41 @@ if (detailView){
 		// Find all <a> elements and filter by text content
 		var recalcA = Array.from(document.querySelectorAll('a')).find(a => a.textContent.trim() === "Recent actions");
 
-		if (recalcA) {
+			if (recalcA) {
 
-				var recalcLi = recalcA.closest('li');
+					var recalcLi = recalcA.closest('li');
+					if (!recalcLi || !recalcLi.parentNode){
+						logMissingElement("order check accessories option", 'li parent for "Recent actions"');
+					} else {
+						// create a new li element
+						var newLi = document.createElement('li');
+						newLi.innerHTML = `
+						<i class="icn-cobra-shuffle"></i>
+						<a data-toggle="" id="check-accessories" href="#">Check Accessories</a>`;
+
+						// insert the new li after the recalcLi
+						recalcLi.parentNode.insertBefore(newLi, recalcLi.nextSibling);
+
+						// add event listener to the new li
+						newLi.addEventListener("click", function() {
+							console.log("Check Accessories clicked");
+							// send a message to the background script
+							chrome.runtime.sendMessage({messageType: "forceAllStockUpdate"});
+						});
+					}
 		
-				// create a new li element
-				var newLi = document.createElement('li');
-				newLi.innerHTML = `
-				<i class="icn-cobra-shuffle"></i>
-				<a data-toggle="" id="check-accessories" href="#">Check Accessories</a>`;
-
-				// insert the new li after the recalcLi
-				recalcLi.parentNode.insertBefore(newLi, recalcLi.nextSibling);
-
-				// add event listener to the new li
-				newLi.addEventListener("click", function() {
-					console.log("Check Accessories clicked");
-					// send a message to the background script
-					chrome.runtime.sendMessage({messageType: "forceAllStockUpdate"});
-				});
-		
-		}
+			}
 
 		
 		// Add complete buttons for each activity
 		// find all a elements with the classes "favourite activity unpinned"
 		var activityAs = document.querySelectorAll('a.favourite.activity.unpinned');
 		activityAs.forEach(function(activityA) {
+			const activityRow = activityA.closest('tr');
+			if (!activityRow){
+				return;
+			}
+
 			const newCompleteButton = document.createElement('a');
 			newCompleteButton.href = "#";
 			newCompleteButton.classList.add('activity-complete-btn');
@@ -4679,7 +5185,7 @@ if (detailView){
 
 
 			// get the id of the closest tr
-			const thisActivityId = activityA.closest('tr').id.replace('id-','');
+			const thisActivityId = activityRow.id.replace('id-','');
 
 
 			newCompleteButton.addEventListener("click", function(event) {
@@ -4687,7 +5193,8 @@ if (detailView){
 				// get the closest a.title element and extract the text
 				// get the tr
 				const activityRow = activityA.closest('tr');
-				const activityTitle = activityRow.querySelector('td.content-title').innerText.trim();
+				const activityTitleElement = activityRow ? activityRow.querySelector('td.content-title') : null;
+				const activityTitle = activityTitleElement ? activityTitleElement.innerText.trim() : "this activity";
 
 
 
@@ -4720,12 +5227,18 @@ if (detailView){
 						// now get the number of tbody elements left in the table
 						const remainingTbody = table.querySelectorAll('tbody').length;
 
-						// find in the document the a element with name="activities"
-						const activitiesA = document.querySelector('a[name="activities"]');
-						// get the parent div of the a element
-						const parentDiv = activitiesA.closest('div');
-						// get the div with class "listing-label-number" inside the parent div
-						const activityLabelDiv = parentDiv.querySelector('div.listing-label-number');
+							// find in the document the a element with name="activities"
+							const activitiesA = document.querySelector('a[name="activities"]');
+							if (!activitiesA){
+								return;
+							}
+							// get the parent div of the a element
+							const parentDiv = activitiesA.closest('div');
+							if (!parentDiv){
+								return;
+							}
+							// get the div with class "listing-label-number" inside the parent div
+							const activityLabelDiv = parentDiv.querySelector('div.listing-label-number');
 
 						if (activityLabelDiv){
 							console.log(activityLabelDiv);
@@ -4741,32 +5254,9 @@ if (detailView){
 			}
 		})
 	
-
-
-
 	} catch (err){
 		console.log(err);
 	}
-
-
-
-} else if (globalSearchView){
-
-	var searchTerm = returnGlobalSearchTerm();
-	if (searchTerm){
-		chrome.runtime.sendMessage({messageType: "globalsearchscrape", messageText: searchTerm});
-	}
-
-	const theForm = document.querySelector("form.form-search");
-		if (theForm){
-		theForm.addEventListener('submit', function(event) {
-			searchTerm = document.getElementById("search_term").value;
-			if (searchTerm.length > 0){
-					chrome.runtime.sendMessage({messageType: "globalsearchscrape", messageText: searchTerm});
-			}
-		});
-	}
-
 }
 
 
@@ -4792,16 +5282,25 @@ function returnGlobalSearchTerm() {
 
 
 if (detailView){
-	// Add an event listener to the select all check box
-	var checkAllBox = document.getElementById("asset_select_all")
-	checkAllBox.addEventListener('click', function(event) {
+	initialiseDetailSelectAllHandler();
+}
 
+async function initialiseDetailSelectAllHandler(){
+	const checkAllBox = await waitForOptionalElement("#asset_select_all", "detail select all handler", 15000);
+	if (!checkAllBox){
+		return;
+	}
+
+	checkAllBox.addEventListener('click', function(event) {
 		setTimeout(function(){
 			if (checkAllBox.checked){
 				itemSelects = document.querySelectorAll("input.item-select");
 
 				itemSelects.forEach((item) => {
 					var theRow = item.closest("li.grid-body-row");
+					if (!theRow){
+						return;
+					}
 					if (theRow.classList.contains("hide-nonsub")){
 						item.checked = false;
 					} else if (theRow.classList.contains("hide-nonbulk")){
@@ -4813,12 +5312,10 @@ if (detailView){
 					} else if (theRow.classList.contains("hide-nonshort")){
 						item.checked = false;
 					}
-
 				});
 			}
-			}, 10);
+		}, 10);
 	});
-
 }
 
 
@@ -4840,22 +5337,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 
 if (detailView){
+	initialiseDetailFocusHandlers();
+}
+
+async function initialiseDetailFocusHandlers(){
 	try { // try block in case some ellements may not exist in some circumstances
+			await waitForElement("#quick_prepare.tab-pane", 15000);
 
-		// Add an event listener to the Free Scan toggle slider, to make the asset input box focus afterwards
-		var freeScanElement = document.querySelectorAll('label[for="free_scan"][class="checkbox toggle android"]');
-		freeScanElement[0].addEventListener('click', function(event) {
-			focusInput();
-		});
+				// Add an event listener to the Free Scan toggle slider, to make the asset input box focus afterwards
+				var freeScanElement = document.querySelectorAll('label[for="free_scan"][class="checkbox toggle android"]');
+			if (freeScanElement[0]){
+				freeScanElement[0].addEventListener('click', function(event) {
+					focusInput();
+				});
+			} else {
+				logMissingElement("detail focus handlers", 'label[for="free_scan"][class="checkbox toggle android"]');
+			}
 
-		// Add an event listener to the Mark As Prepared toggle slider, to make the asset input box focus afterwards
-		var freeScanElement = document.querySelectorAll('label[for="mark_as_prepared"][class="checkbox toggle android"]');
-		freeScanElement[0].addEventListener('click', function(event) {
-			focusInput();
-		});
+			// Add an event listener to the Mark As Prepared toggle slider, to make the asset input box focus afterwards
+			var markAsPreparedElement = document.querySelectorAll('label[for="mark_as_prepared"][class="checkbox toggle android"]');
+			if (markAsPreparedElement[0]){
+				markAsPreparedElement[0].addEventListener('click', function(event) {
+					focusInput();
+				});
+			} else {
+				logMissingElement("detail focus handlers", 'label[for="mark_as_prepared"][class="checkbox toggle android"]');
+			}
 
-		// Add an event listener to all collapse and expand buttons
-		var expandButtons = document.querySelectorAll('button[data-action="expand"], button[data-action="collapse"]');
+			// Add an event listener to the SmartScan toggle slider, to make the asset input box focus afterwards
+			waitForOptionalElement('label.checkbox.toggle.android[for="smart_scan"]', "detail focus handlers", 15000).then((smartScanElement) => {
+				if (smartScanElement){
+					smartScanElement.addEventListener('click', function(event) {
+						focusInput();
+					});
+				}
+			});
+
+			// Add an event listener to all collapse and expand buttons
+			var expandButtons = document.querySelectorAll('button[data-action="expand"], button[data-action="collapse"]');
+			if (expandButtons.length === 0){
+				logMissingElement("detail focus handlers", 'button[data-action="expand"], button[data-action="collapse"]');
+			}
 
 		// loop through each button and add a click event listener
 		expandButtons.forEach(function(button) {
@@ -4865,8 +5387,11 @@ if (detailView){
 			});
 		});
 
-		// Add an event listener to all lock/unlock buttons
-		var lockButtons = document.querySelectorAll('a[data-unlock-title="Unlock this group"]');
+			// Add an event listener to all lock/unlock buttons
+			var lockButtons = document.querySelectorAll('a[data-unlock-title="Unlock this group"]');
+			if (lockButtons.length === 0){
+				logMissingElement("detail focus handlers", 'a[data-unlock-title="Unlock this group"]');
+			}
 
 		// loop through each button and add a click event listener
 		lockButtons.forEach(function(button) {
@@ -4878,25 +5403,103 @@ if (detailView){
 			});
 		});
 
-		// Add an event listener to Detail View mode buttons
-		var detailModeButtons = document.querySelectorAll('a[class="btn"][data-toggle="tab"]');
+			// Add an event listener to all check boxes
+			var lineCheckBoxes = document.querySelectorAll('input.item-select');
+			if (lineCheckBoxes.length === 0){
+				logMissingElement("detail focus handlers", "input.item-select");
+			}
 
 		// loop through each button and add a click event listener
-		detailModeButtons.forEach(function(button) {
+		lineCheckBoxes.forEach(function(button) {
 			button.addEventListener("click", function() {
+
 				// do something when the button is clicked
-				detailViewMode = button.lastChild.textContent.toLowerCase().toString().trim();;
-				console.log(detailViewMode);
+				focusInput();
+
 			});
 		});
 
-
-		chrome.storage.local.get(["allocateDefault"]).then((result) => {
-			if (result.allocateDefault != "false" && detailViewMode == "functions"){
-				var allocateButton = document.querySelector('a.btn[href="#quick_allocate"]');
-				allocateButton.click();
+			// Add an event listener to the select all checkbox
+			var selectAllBox = document.querySelector('input.select-all-items');
+			if (selectAllBox){
+				selectAllBox.addEventListener('click', function(event) {
+					focusInput();
+				});
+			} else {
+				logMissingElement("detail focus handlers", "input.select-all-items");
 			}
-		});
+
+				// Add an event listener to Detail View mode buttons
+				let detailModeManuallySelected = false;
+				var detailModeButtons = document.querySelectorAll('a.btn[data-toggle="tab"]');
+				if (detailModeButtons.length === 0){
+					logMissingElement("detail mode handlers", 'a.btn[data-toggle="tab"]');
+				}
+
+				const detailModeByHref = {
+					"#quick_allocate": "allocate",
+					"#quick_prepare": "prepare",
+					"#quick_book_out": "book out",
+					"#quick_check_in": "check-in"
+				};
+				const detailModesWithInputs = new Set(Object.values(detailModeByHref));
+				const getDetailModeFromButton = (button) => {
+					const href = button.getAttribute("href");
+					if (detailModeByHref[href]){
+						return detailModeByHref[href];
+					}
+
+					const textMode = button.textContent.toLowerCase().trim().replace(/\s+/g, " ");
+					return textMode === "check in" ? "check-in" : textMode;
+				};
+
+				// loop through each button and add a click event listener
+				detailModeButtons.forEach(function(button) {
+					button.addEventListener("click", function(event) {
+						detailViewMode = getDetailModeFromButton(button);
+						if (event.isTrusted){
+							detailModeManuallySelected = true;
+							if (detailModesWithInputs.has(detailViewMode)){
+								setTimeout(focusInput, 0);
+							}
+						}
+						console.log(detailViewMode);
+					});
+				});
+
+
+
+
+
+
+
+
+				const allocateDefaultResult = await chrome.storage.local.get(["allocateDefault"]);
+				if (allocateDefaultResult.allocateDefault != "false" && detailViewMode == "functions"){
+					const allocateButton = await waitForOptionalElement('a.btn[href="#quick_allocate"]', "allocate default", 15000);
+					if (allocateButton){
+						const isAllocateTabActive = () => {
+							const activeAllocateButton = document.querySelector('a.btn[href="#quick_allocate"]');
+							const activeAllocatePane = document.querySelector("#quick_allocate");
+							return (activeAllocateButton && activeAllocateButton.closest("li.active")) || (activeAllocatePane && activeAllocatePane.classList.contains("active"));
+						};
+						const clickAllocateIfNeeded = () => {
+							if (detailModeManuallySelected || isAllocateTabActive()){
+								return;
+							}
+
+							const currentAllocateButton = document.querySelector('a.btn[href="#quick_allocate"]');
+							if (currentAllocateButton){
+								currentAllocateButton.click();
+								focusInput();
+							}
+						};
+
+						[0, 250, 750, 1500, 3000, 5000].forEach((delay) => {
+							setTimeout(clickAllocateIfNeeded, delay);
+						});
+					}
+				}
 
 		chrome.storage.local.get(["soundsOn"]).then((result) => {
 			console.log("Sound = "+result.soundsOn);
@@ -4911,7 +5514,6 @@ if (detailView){
 	catch(err) {
 		console.log(err);
 	}
-
 }
 
 
@@ -4927,19 +5529,28 @@ if (detailView){
 // function to put the page focus to the scanner input box
 function focusInput(){
 	if (detailView){
+		let inputId = "";
 		switch (detailViewMode) {
 			case "allocate":
-				document.getElementById("stock_level_asset_number").focus();
+				inputId = "stock_level_asset_number";
 				break;
 			case "prepare":
-				document.getElementById("p_stock_level_asset_number").focus();
+				inputId = "p_stock_level_asset_number";
 				break;
 			case "book out":
-				document.getElementById("bo_stock_level_asset_number").focus();
+				inputId = "bo_stock_level_asset_number";
 				break;
 			case "check-in":
-				document.getElementById("ci_stock_level_asset_number").focus();
+				inputId = "ci_stock_level_asset_number";
 				break;
+		}
+		if (inputId){
+			const inputElement = document.getElementById(inputId);
+			if (inputElement){
+				inputElement.focus();
+			} else {
+				logMissingElement("focus input", `#${inputId}`);
+			}
 		}
 	}
 }
@@ -4963,17 +5574,19 @@ chrome.runtime.sendMessage({messageType: "check"}, function(response) {
 // auto set "mark as prepared" to on depending on the user setting
 chrome.storage.local.get(["setPrepared"]).then((result) => {
 	if (result.setPrepared != "false" && detailView){
-
-		var preparedCheckbox = document.getElementById('mark_as_prepared');
-		if(!preparedCheckbox.checked){
-			preparedCheckbox.click();
-		};
-
-		//var preparedButton = document.querySelectorAll('label[for="mark_as_prepared"][class="checkbox toggle android"]');
-		//preparedButton[0].click();
-		focusInput();
+		waitForOptionalElement("#mark_as_prepared", "set prepared default", 15000).then((preparedCheckbox) => {
+			if (!preparedCheckbox){
+				return;
+			}
+			if(!preparedCheckbox.checked){
+				preparedCheckbox.click();
+			};
+			focusInput();
+		});
 	}
 });
+
+
 
 
 // Messages from the extension service worker to trigger changes
@@ -5035,22 +5648,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 	}
 
-	if (message.messageType == "availabilityData"){
-			console.log("Availability data was delivered");
-			//console.log(message.messageData);
-			if (orderView){
-				addAvailability(message.messageData);
-			}
-	}
+		if (message.messageType == "availabilityData"){
+				console.log("Availability data was delivered");
+				//console.log(message.messageData);
+				if (orderView){
+					waitForOptionalElement("#opportunity_items_body, #opportunity_items_scrollable", "order availability data", 15000).then((itemList) => {
+						if (itemList){
+							addAvailability(message.messageData);
+						}
+					});
+				}
+		}
 
 	// handle scrape returns for warehouse notes and also subhire members
 	if (message.messageType == "warehouseNotesData"){
 			console.log("Warehouse Notes Data was delivered");
 			console.log(message.messageData);
-			if (orderView){
+				if (orderView){
+					waitForOptionalElement("#opportunity_items_body, #opportunity_items_scrollable", "order warehouse notes data", 15000).then((itemList) => {
+						if (!itemList){
+							return;
+						}
 
-				let obj = message.messageData.warehouseNotesLog;
-				for (let key in obj) {
+					let obj = message.messageData.warehouseNotesLog;
+					for (let key in obj) {
 					if (obj.hasOwnProperty(key)) {  // Ensures the key belongs to the object, not its prototype
 						let value = obj[key];
 
@@ -5100,11 +5721,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 								memberElement.innerText = memberName;
 							}
 
+							}
 						}
 					}
+					});
 				}
-			}
-	}
+		}
 
 
 	if (message.messageType == "productQtyData"){
@@ -5163,14 +5785,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 			console.log(nestedTotals);
 			applyNestedCharges();
 		});
-
-
-
+	} else if (message == "containerCheck"){
+		chrome.storage.local.get(["containerCheck"]).then((result) => {
+			console.log(result);
+			if (result.containerCheck == "true"){
+				containerCheck = true;
+			} else {
+				containerCheck = false;
+			}
+			console.log(containerCheck);
+		});
 	}
 
-
-
-	
 	if (message.messageType == "oppScrapeData" && globalSearchView){
 		// hand global search return
 
@@ -5319,7 +5945,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 
 if (detailView){
-	activeIntercept(); // Intercept scanning actions to handle special scans without submitting the form
+	waitForOptionalElement("#stock_level_asset_number", "scan intercept", 15000).then((scanInput) => {
+		if (scanInput){
+			activeIntercept(); // Intercept scanning actions to handle special scans without submitting the form
+		}
+	});
 };
 
 
@@ -5341,34 +5971,59 @@ function hideDeleteButtons(){
 
 
 function activeIntercept(){
-	if (detailView){
+		if (detailView){
 
-		// allocate panel items
-		allocateScanBox = document.getElementById("stock_level_asset_number");
-		var parentSpan = allocateScanBox.parentNode;
-		var quantityBox = document.querySelector('input[type="text"][name="quantity"]');
-		var containerBox = document.querySelector('input[type="text"][name="container"]');
+			// allocate panel items
+			allocateScanBox = document.getElementById("stock_level_asset_number");
+			if (!allocateScanBox){
+				logMissingElement("scan intercept", "#stock_level_asset_number");
+				return;
+			}
 
-		// book out panel items
-		bookoutScanBox = document.getElementById("bo_stock_level_asset_number");
-		boContainerBox = document.getElementById('bo_container');
+			var parentSpan = allocateScanBox.parentNode;
+			var quantityBox = document.querySelector('input[type="text"][name="quantity"]');
+			var containerBox = document.querySelector('input[type="text"][name="container"]');
+			if (!quantityBox){
+				logMissingElement("scan intercept", 'input[type="text"][name="quantity"]');
+			}
+			if (!containerBox){
+				logMissingElement("scan intercept", 'input[type="text"][name="container"]');
+			}
 
-		function resetScanBox(){
-			// block to clear the allocate and book out boxes after an intercept
-			allocateScanBox.value = '';
-			bookoutScanBox.value = '';
+			// book out panel items
+			bookoutScanBox = document.getElementById("bo_stock_level_asset_number");
+			boContainerBox = document.getElementById('bo_container');
+			if (!bookoutScanBox){
+				logMissingElement("book-out scan intercept", "#bo_stock_level_asset_number");
+			}
+			if (!boContainerBox){
+				logMissingElement("book-out scan intercept", "#bo_container");
+			}
 
-			parentSpan = allocateScanBox.parentNode;
-			var htmlFudge = parentSpan.innerHTML;
-			parentSpan.innerHTML = htmlFudge;
+			function resetScanBox(){
+				// block to clear the allocate and book out boxes after an intercept
+				if (allocateScanBox){
+					allocateScanBox.value = '';
+				}
+				if (bookoutScanBox){
+					bookoutScanBox.value = '';
+				}
 
-			boParentSpan = bookoutScanBox.parentNode;
-			var boHtmlFudge = boParentSpan.innerHTML;
-			boParentSpan.innerHTML = boHtmlFudge;
+				if (allocateScanBox && allocateScanBox.parentNode){
+					parentSpan = allocateScanBox.parentNode;
+					var htmlFudge = parentSpan.innerHTML;
+					parentSpan.innerHTML = htmlFudge;
+				}
 
-			setTimeout(focusInput, 100); // delayed to avoid the jQuery function messing it up
-			activeIntercept(); // need to re-run because we've just nuked the scan section DOM so the event listener won't work
-		}
+				if (bookoutScanBox && bookoutScanBox.parentNode){
+					boParentSpan = bookoutScanBox.parentNode;
+					var boHtmlFudge = boParentSpan.innerHTML;
+					boParentSpan.innerHTML = boHtmlFudge;
+				}
+
+				setTimeout(focusInput, 100); // delayed to avoid the jQuery function messing it up
+				activeIntercept(); // need to re-run because we've just nuked the scan section DOM so the event listener won't work
+			}
 
 		// event listener for the scanbox in the Allocate panel
 		allocateScanBox.addEventListener("keypress", function(event) {
@@ -5381,39 +6036,35 @@ function activeIntercept(){
 
 				console.log("Intercepted scan: " + myScan);
 
-				// item scanned is listed as a serialised container
-				if (containerDataList.includes(myScan)){
 
-					const freeScan = checkFreeScan();
-					if (!freeScan){
-		
-					//event.preventDefault(); // for testing only
-					console.log("Scanned item is a container");
-					//get the container from containerData
+				// 1: Check if the scanned item is in quarantine and block if required
+
+				if (quarantinedItemList.includes(myScan) && blockQuarantines){
+					// this item is in quarantine
+					event.preventDefault();
+
+					const matchingQuarantines = quarantineData.quarantines.filter(quarantines => quarantines.stock_level.asset_number == myScan);
+
+					console.log(matchingQuarantines);
+					if (matchingQuarantines.length > 0){
+						var quarantineId = matchingQuarantines[0].id;
+						console.log(quarantineId);
+					}
+
+					makeToast("toast-error", "Blocked from allocating a quarantined asset.");
+					makeToast("toast-error", "Asset "+myScan+" is in quarantine.<p><a class='toast-link' href='https://"+apiSubdomain+".current-rms.com/quarantines/"+quarantineId+"' target='_blank'>View Record</a>");
+					resetScanBox();
+					return;
 				
-					let thisContainer = containerData[myScan];
-					if (thisContainer){
-						console.log(thisContainer);
-						// create an array of the item_name of every item in thisContainer, but only if the item.accessory only value is false
-						thisContainer = thisContainer.filter(n => !n.item.accessory_only);
-						console.log(thisContainer);
-
-
-
-						const containerProductNames = thisContainer.map(item => item.item_name);
-
-						const productsToCheck = listReservedProducts();
-						console.log(productsToCheck);
-						
-						// check if the containerProductNames includes any of the productsToCheck
-						const matchingProducts = containerProductNames.filter(product => productsToCheck.includes(product));
-						console.log(matchingProducts);
-					}
-					//return;
-					}
+				} else if (quarantinedItemList.includes(myScan) && !blockQuarantines){
+					// this item is in quarantine but we're set to allow it through
+					makeToast("toast-error", "Asset "+myScan+" is in quarantine.");
 				}
+				
+				// 2. Handle any "special" barcode scans and container related scanning
 
-
+				 
+				
 				if (myScan.toLowerCase() != "revert" && revertScan){
 					// we have prompted the user for an item to revert
 					event.preventDefault();
@@ -5428,96 +6079,38 @@ function activeIntercept(){
 						makeToast("toast-error", "Failed to revert "+myScan+" because it is not currently allocated.");
 						sayWord("Failed to revert. Not on the job.")
 					}
-
+	
 				} else if (myScan.toLowerCase() != "remove" && removeScan){
-						// we have prompted the user for an item to revert
-						event.preventDefault();
-						resetScanBox();
-						listAssets();
-						if (assetsOnTheJob.includes(myScan)){
-							removeAsset(myScan);
-							removeScan = false;
-						} else {
-							errorSound();
-							removeScan = false;
-							makeToast("toast-error", "Failed to remove "+myScan+" because it is not currently allocated.");
-							sayWord("Failed to remove. Not on the job.");
-						}
-						
-
-				} else if (quarantinedItemList.includes(myScan) && blockQuarantines){
-							// this item is in quarantine
-							event.preventDefault();
-
-							const matchingQuarantines = quarantineData.quarantines.filter(quarantines => quarantines.stock_level.asset_number == myScan);
-
-							console.log(matchingQuarantines);
-							if (matchingQuarantines.length > 0){
-								var quarantineId = matchingQuarantines[0].id;
-								console.log(quarantineId);
-							}
-
-							makeToast("toast-error", "Blocked from allocating a quarantined asset.");
-							makeToast("toast-error", "Asset "+myScan+" is in quarantine.<p><a class='toast-link' href='https://"+apiSubdomain+".current-rms.com/quarantines/"+quarantineId+"' target='_blank'>View Record</a>");
-							resetScanBox();
-				} else if (quarantinedItemList.includes(myScan) && !blockQuarantines){
-								// this item is in quarantine but we're set to allow it through
-								makeToast("toast-error", "Asset "+myScan+" is in quarantine.");
-
-				
-
-					// In the case that we have scanned a *freescan* barcode
+					// we have prompted the user for an item to revert
+					event.preventDefault();
+					resetScanBox();
+					listAssets();
+					if (assetsOnTheJob.includes(myScan)){
+						removeAsset(myScan);
+						removeScan = false;
+					} else {
+						errorSound();
+						removeScan = false;
+						makeToast("toast-error", "Failed to remove "+myScan+" because it is not currently allocated.");
+						sayWord("Failed to remove. Not on the job.");
+					}
+	
 				} else if (myScan.toLowerCase() == "freescan"){
-						event.preventDefault();
-						freeScanToggle();
-						resetScanBox();
+					// In the case that we have scanned a *freescan* barcode
+					event.preventDefault();
+					freeScanToggle();
+					resetScanBox();
+				
+				} else if (myScan.toLowerCase() == "smartscan"){
+					// In the case that we have scanned a *freescan* barcode
+					event.preventDefault();
+					smartScanToggle();
+					resetScanBox();
 
+				} else if (myScan.toLowerCase() == "container"){
 					// In the case that we have scanned a *container* barcode
-				}else if (myScan.toLowerCase() == "container"){
-						if (containerScan){
-							// Means the user scanned *container* twice and we want to clear the container field
-							containerScan = false;
-							shortAlertSound();
-							sayWord("Container cleared.")
-							containerBox.value = '';
-							event.preventDefault();
-							makeToast("toast-info", "Container cleared.", 5);
-							resetScanBox();
-						} else {
-							// We need to prompt the user to scan a container
-							event.preventDefault();
-							sayWord("Scan container");
-							containerScan = true;
-							makeToast("toast-info", "Now scan the container.", 5);
-							resetScanBox();
-						}
-
-					}else if (containerScan){
-						// we are set to receive a value for the container field.
-						listAssets();
-						if (assetsOnTheJob.includes(allocateScanBox.value)){
-							// the container is already listed on the opportunity
-							event.preventDefault();
-							containerScan = false;
-							scanSound();
-							containerBox.value = allocateScanBox.value;
-							makeToast("toast-info", "Container set to "+containerBox.value, 5);
-							resetScanBox();
-							setTimeout(sayWord("Container set."), 500);
-
-						} else {
-							// the container is not yet allocated.
-							containerScan = false;
-							freeScanReset = checkFreeScan();
-							if (!freeScanReset){
-								setFreeScan(true);
-							}
-							// set the scanningContainer value to this container and let it go through as a scan to be allocated (don't block default)
-							scanningContainer = allocateScanBox.value;
-						}
-
-					}else if (myScan == containerBox.value && containerBox.value != "") {
-						// we scanned an asset that is already set as the current container, which means "clear the container field"
+					if (containerScan){
+						// Means the user scanned *container* twice and we want to clear the container field
 						containerScan = false;
 						shortAlertSound();
 						sayWord("Container cleared.")
@@ -5525,110 +6118,262 @@ function activeIntercept(){
 						event.preventDefault();
 						makeToast("toast-info", "Container cleared.", 5);
 						resetScanBox();
-					} else if (containerExists(myScan)) {
-						// we have scanned an asset that is already a container in this opportunity.
+					} else {
+						// We need to prompt the user to scan a container
+						event.preventDefault();
+						sayWord("Scan container");
+						containerScan = true;
+						makeToast("toast-info", "Now scan the container.", 5);
+						resetScanBox();
+					}
+	
+
+				} else if (containerScan){
+					// we are set to receive a value for the container field.
+					listAssets();
+					if (assetsOnTheJob.includes(myScan)){
+						// the container is already listed on the opportunity
 						event.preventDefault();
 						containerScan = false;
 						scanSound();
-						containerBox.value = allocateScanBox.value;
+						containerBox.value = myScan;
 						makeToast("toast-info", "Container set to "+containerBox.value, 5);
 						resetScanBox();
-						setTimeout(sayWord("Container set."), 500);
+						setTimeout(() => sayWord("Container set."), 500);
 
 
-
-					} else if (myScan.charAt(0) === '%'){
-						// this is a special scan of a bulk barcode that includes a Quantity
-
-						// Define a regular expression to match the pattern "%{integer}%{rest-of-the-string}"
-						const regex = /^%(\d+)%(.+)$/;
-						// Use the exec() method to extract matches
-						const matches = regex.exec(myScan);
-
-						if (matches) {
-								// matches[1] contains the bulkQuantity, matches[2] contains the bulkAsset
-								const bulkQuantity = parseInt(matches[1], 10);
-
-								if (!isNaN(bulkQuantity)) {
-										// Check if bulkQuantity is a valid integer
-										const bulkAsset = matches[2];
-										quantityBox.value = bulkQuantity;
-										allocateScanBox.value = bulkAsset;
-										console.log("bulkQuantity:", bulkQuantity);
-										console.log("bulkAsset:", bulkAsset);
-								} else {
-										console.log("Invalid bulkQuantity. It must be an integer.");
-								}
-						} else {
-								console.log("String does not match the expected pattern.");
+					} else {
+						// the container is not yet allocated.
+						containerScan = false;
+						freeScanReset = checkFreeScan();
+						if (!freeScanReset){
+							setFreeScan(true);
 						}
+						// set the scanningContainer value to this container and let it go through as a scan to be allocated (don't block default)
+						scanningContainer = myScan;
 
-
-					} else if (myScan.toLowerCase() === 'revert'){
-						// this is a special scan to invoke revert status on an item
-						if (revertScan){ // Means double scan of *revert*
-							event.preventDefault();
-							sayWord("Revert cancelled.");
-							revertScan = false;
-							makeToast("toast-info", "Revert scan cancelled.", 5);
-							// block to clear the allocate box after an intercept
-							resetScanBox();
-						} else {
-							// We need to prompt the user to scan the item to be reverted
-							event.preventDefault();
-							sayWord("Scan item to revert");
-							revertScan = true;
-							makeToast("toast-info", "Scan the item to be reverted.", 5);
-							// block to clear the allocate box after an intercept
-							resetScanBox();
-						}
-
-					} else if (myScan.toLowerCase() === 'remove'){
-						// this is a special scan to invoke remove on an item
-						if (removeScan){ // Means double scan of *revert*
-							event.preventDefault();
-							sayWord("Remove cancelled.");
-							removeScan = false;
-							makeToast("toast-info", "Remove scan cancelled.", 5);
-							// block to clear the allocate box after an intercept
-							resetScanBox();
-						} else {
-							// We need to prompt the user to scan the item to be reverted
-							event.preventDefault();
-							sayWord("Scan item to remove");
-							removeScan = true;
-							makeToast("toast-info", "Scan the item to be removed.", 5);
-							// block to clear the allocate box after an intercept
-							resetScanBox();
-						}
-					} else if (myScan.toLowerCase() === 'bookout'){
-						// this is a special scan to switch to the bookout tab
-					 
-							event.preventDefault();
-							sayWord("Book Out Mode");
-							makeToast("toast-info", "Changed to Book Out mode.", 5);
-							// block to clear the allocate box after an intercept
-							resetScanBox();
-							// find a element with href="#quick_book_out"
-							var bookOutButton = document.querySelector('a.btn[href="#quick_book_out"]');
-							if (bookOutButton){
-								bookOutButton.click();
+						// check for possibility that this container item is also a smart scan candidate
+						if (
+							smartScan &&
+							Object.prototype.hasOwnProperty.call(smartScanCandidates, myScan)
+						){
+							// item scanned is listed as a smart scan candidate
+							const targetItemId = smartScanCandidates[myScan];
+							const stockInfo = allStock.stock_levels.find(
+								s => s.asset_number.trim() === myScan.trim()
+							);
+	
+							if (!stockInfo) {
+								console.warn("SmartScan: asset not found in allStock:", myScan);
+							} else {
+								event.preventDefault();
+								handleSmartScan(myScan, targetItemId, stockInfo.id, stockInfo.asset_number);
+								resetScanBox();
+								return;
 							}
-						
-					} else if (myScan.toLowerCase() == "test"){
-						// test scan for development purposes
-						// Test code here.
-						sayWord("test");
+						}
 
+
+
+					}
+
+				} else if (myScan == containerBox.value && containerBox.value != "") {
+					// we scanned an asset that is already set as the current container, which means "clear the container field"
+					containerScan = false;
+					shortAlertSound();
+					sayWord("Container cleared.")
+					containerBox.value = '';
+					event.preventDefault();
+					makeToast("toast-info", "Container cleared.", 5);
+					resetScanBox();
+
+				} else if (containerExists(myScan)) {
+					// we have scanned an asset that is already a container in this opportunity.
+					event.preventDefault();
+					containerScan = false;
+					scanSound();
+					containerBox.value = allocateScanBox.value;
+					makeToast("toast-info", "Container set to "+containerBox.value, 5);
+					resetScanBox();
+					setTimeout(() => sayWord("Container set."), 500);
+
+				} else if (myScan.toLowerCase() === 'revert'){
+					// this is a special scan to invoke revert status on an item
+					if (revertScan){ // Means double scan of *revert*
 						event.preventDefault();
+						sayWord("Revert cancelled.");
+						revertScan = false;
+						makeToast("toast-info", "Revert scan cancelled.", 5);
+						// block to clear the allocate box after an intercept
 						resetScanBox();
+					} else {
+						// We need to prompt the user to scan the item to be reverted
+						event.preventDefault();
+						sayWord("Scan item to revert");
+						revertScan = true;
+						makeToast("toast-info", "Scan the item to be reverted.", 5);
+						// block to clear the allocate box after an intercept
+						resetScanBox();
+					}
+	
+				} else if (myScan.toLowerCase() === 'remove'){
+					// this is a special scan to invoke remove on an item
+					if (removeScan){ // Means double scan of *revert*
+						event.preventDefault();
+						sayWord("Remove cancelled.");
+						removeScan = false;
+						makeToast("toast-info", "Remove scan cancelled.", 5);
+						// block to clear the allocate box after an intercept
+						resetScanBox();
+					} else {
+						// We need to prompt the user to scan the item to be reverted
+						event.preventDefault();
+						sayWord("Scan item to remove");
+						removeScan = true;
+						makeToast("toast-info", "Scan the item to be removed.", 5);
+						// block to clear the allocate box after an intercept
+						resetScanBox();
+					}
+				} else if (myScan.toLowerCase() === 'bookout'){
+					// this is a special scan to switch to the bookout tab
+					
+						event.preventDefault();
+						sayWord("Book Out Mode");
+						makeToast("toast-info", "Changed to Book Out mode.", 5);
+						// block to clear the allocate box after an intercept
+						resetScanBox();
+						// find a element with href="#quick_book_out"
+						var bookOutButton = document.querySelector('a.btn[href="#quick_book_out"]');
+						if (bookOutButton){
+							bookOutButton.click();
+						}
 
-					} // end if scan block
-				// Passed all of that means this is a regular item we're scanning.
+				// 3. Check if we're scanning a container that appears irrelevant
+				// item scanned is listed as a serialised container
+				} else if (containerCheck && containerDataList.includes(myScan)){
 
-				lastScan = myScan; // log the asset ready for potential smart scan
+					const freeScan = checkFreeScan();
+					if (!freeScan) {
+						//event.preventDefault(); // for testing only
+						console.log("Scanned item is a container");
+						//get the container from containerData
+				
+						let thisContainer = containerData[myScan];
+						if (thisContainer){
+							console.log(thisContainer);
+							// create an array of the item_name of every item in thisContainer, but only if the item.accessory only value is false
+							thisContainer = thisContainer.filter(n => !n.item.accessory_only);
+							console.log(thisContainer);
 
-			} // end of if enter key block
+							const containerProductNames = thisContainer.map(item => item.item_name);
+							console.log(containerProductNames);
+
+							const productsToCheck = listReservedProducts();
+							console.log(productsToCheck);
+
+							// check if the actual container item is relevant
+							const stockInfo = allStock.stock_levels.find(s => s.asset_number.trim() === myScan.trim());
+							const scannedProduct = stockInfo.item.name;
+							console.log(scannedProduct);
+
+							containerProductNames.push(scannedProduct);
+							
+							// check if the containerProductNames includes any of the productsToCheck
+							const matchingProducts = containerProductNames.filter(product => productsToCheck.includes(product));
+							console.log(matchingProducts);
+							
+							if (matchingProducts.length > 0){
+								// This container is potentially relevent and so will not be blocked
+								lastScan = myScan;
+							} else {
+
+								let containerStockLevelId = containerData[myScan][0].container_stock_level_id;
+								console.log(containerStockLevelId);
+								event.preventDefault();
+								makeToast("toast-error", "Failed to allocate asset(s)");
+								makeToast("toast-error", `<span>The contents of <a href="/serialised_containers/${containerStockLevelId}" target="_blank"><u>container '${myScan}'</a></u> appear irrelevant to this opportunity. Use Free Scan to allocate/prepare anyway.</span>`);
+								setTimeout(() => sayWord("Irrelevant container."), 500);
+								resetScanBox();
+								return;
+
+							}
+
+						}
+					}
+				
+				// 4. SMART SCAN HANDLER
+				} else if (
+						smartScan &&
+						myScan.length > 0 &&
+						Object.prototype.hasOwnProperty.call(smartScanCandidates, myScan)
+					){
+						// check if the item is a container and containerCheck is not on (will be ignored if it is)
+						let thisContainer = containerData[myScan];
+						if (!thisContainer){
+							// item scanned is listed as a smart scan candidate
+							const targetItemId = smartScanCandidates[myScan];
+							const stockInfo = allStock.stock_levels.find(
+								s => s.asset_number.trim() === myScan.trim()
+							);
+
+							if (!stockInfo) {
+								console.warn("SmartScan: asset not found in allStock:", myScan);
+							} else {
+								lastScan = myScan;
+								event.preventDefault();
+								console.log("smart scan triggered");
+								handleSmartScan(myScan, targetItemId, stockInfo.id, stockInfo.asset_number);
+								resetScanBox();
+								return;
+							}
+						}
+					
+
+			
+				// 5. Special Bulk barcode handler
+
+				} else if (myScan.charAt(0) === '%'){
+					// this is a special scan of a bulk barcode that includes a Quantity
+
+					// Define a regular expression to match the pattern "%{integer}%{rest-of-the-string}"
+					const regex = /^%(\d+)%(.+)$/;
+					// Use the exec() method to extract matches
+					const matches = regex.exec(myScan);
+
+					if (matches) {
+							// matches[1] contains the bulkQuantity, matches[2] contains the bulkAsset
+							const bulkQuantity = parseInt(matches[1], 10);
+
+							if (!isNaN(bulkQuantity)) {
+									// Check if bulkQuantity is a valid integer
+									const bulkAsset = matches[2];
+									quantityBox.value = bulkQuantity;
+									allocateScanBox.value = bulkAsset;
+									console.log("bulkQuantity:", bulkQuantity);
+									console.log("bulkAsset:", bulkAsset);
+									lastScan = myScan; // log the asset ready for potential smart scan
+							} else {
+									console.log("Invalid bulkQuantity. It must be an integer.");
+							}
+					} else {
+							console.log("String does not match the expected pattern.");
+					}
+
+
+				// 6. Catch special test barcode
+				} else if (myScan.toLowerCase() == "test"){
+					// test scan for development purposes
+					// Test code here.
+					sayWord("test");
+
+					event.preventDefault();
+					resetScanBox();
+
+				} else { // end if scan block
+					// If we passed all of that means this is a regular item we're scanning.
+					lastScan = myScan; // log the asset ready for potential smart scan
+				} // end of if enter key block
+			}
 
 		});
 
@@ -5717,7 +6462,7 @@ function activeIntercept(){
 							containerScan = false;
 							scanSound();
 							boContainerBox.value = myScan;
-							makeToast("toast-info", "Container set to "+containerBox.value, 5);
+							makeToast("toast-info", "Container set to "+boContainerBox.value, 5);
 							resetScanBox();
 							setTimeout(sayWord("Container set."), 500);
 
@@ -5975,6 +6720,59 @@ function freeScanToggle(){
 	}
 }
 
+// intercept function to respond to special scans
+function smartScanToggle(){
+	var smartScanActive = false;
+	// Find the parent div with class "free-scan-input"
+	var smartScanDiv = document.querySelector('.smart-scan-toggle');
+
+	// Check if the parent div is found
+	if (smartScanDiv) {
+			// Find the <a> element with class "slide-button" inside the parent div
+			var slideButton = smartScanDiv.querySelector('a.slide-button');
+
+			// Check if the <a> element is found
+			if (slideButton) {
+					// Get the background color of the <a> element
+					var backgroundColour = window.getComputedStyle(slideButton).backgroundColor;
+					// if it's red, that maens it's off and will now be turned on
+					if (backgroundColour == "rgb(204, 0, 30)"){
+						smartScanActive = true;
+					}
+			} else {
+					console.log('Slide button not found');
+			}
+	} else {
+			console.log('Div with class "smart-scan-toggle" not found');
+	}
+
+	// find and click the freescan toggle slider
+	var smartScanButton = document.querySelectorAll('label[for="smart_scan"][class="checkbox toggle android"]');
+	smartScanButton[0].click();
+	focusInput();
+	scanSound();
+
+	if (smartScanActive) {
+		makeToast("toast-info", "Smart Scan turned on.", 3);
+		setTimeout(function() {
+			sayWord("Smart skann Yes");
+		}, 400);
+	} else {
+		setTimeout(function() {
+			makeToast("toast-info", "Smart Scan turned off.", 3);
+			sayWord("Smart skann No");
+		}, 400);
+	}
+}
+
+
+
+
+
+
+
+
+
 // function to create a new toast message
 // example className entries are toast-success, toast-error, toast-info and toast-warning
 function makeToast(className, text, autoDestroyTime) {
@@ -6050,18 +6848,45 @@ function getCurrencySymbol() {
 
 //// SMART SCAN SECTION - WORK IN PROGRESS
 function smartScanSetup(assetScanned){
-	console.log("Asset just scanned was: " + assetScanned);
+
+	if (assetScanned == ""){
+		return;
+	}
+
+
+
+	// reset reserved badges
+	var smartScanBadges = document.querySelectorAll("span.smart-scan-candidate");
+	smartScanBadges.forEach(function(badge) {
+		badge.classList.remove("smart-scan-candidate");
+	});
+
+
+	if (!smartScan){
+		return;
+	}
+
+	if (apiKey == ""){
+		return;
+	}
+
+	smartScanCandidates = {};
+	smartScanCandidateLines = 0;
+	console.log("Asset being run for smart scan setup is: " + assetScanned);
+	console.log("Time now is: " + new Date().toISOString());
+
+
 	var tdElements = document.querySelectorAll("td.optional-01.asset.asset-column");
+
 	// Loop through the elements and find the one with the correct inner text
 	var desiredTdElement = null;
 	for (var i = 0; i < tdElements.length; i++) {
-		//console.log(tdElements[i].innerText.trim());
 		if (tdElements[i].innerText.trim() == assetScanned) {
 			desiredTdElement = tdElements[i];
 			break; // Stop the loop once a match is found
 		}
 	}
-	console.log(desiredTdElement.innerText.trim());
+	
 	var parentRow = desiredTdElement.closest('tr');
 	var oppItemId = parentRow.getAttribute("data-oi-id");
 	console.log("It's opportunity item ID is: " + oppItemId);
@@ -6077,31 +6902,95 @@ function smartScanSetup(assetScanned){
 	console.log("It has children:");
 	console.log(assetScannedHasChildren);
 
+	if (assetScannedHasChildren){
+		var childElements = parentLi.querySelectorAll("td.optional-01.asset.asset-column");
+		for (var i = 0; i < childElements.length; i++) {
 
-	var childElements = parentLi.querySelectorAll("td.optional-01.asset.asset-column");
-	for (var i = 0; i < childElements.length; i++) {
-		console.log(childElements[i].innerText.trim());
-		if (childElements[i].innerText.trim() == "Group Booking") {
+			console.log(childElements[i].innerText.trim());
 
-			var closestTr = childElements[i].closest('tr');
-			var potentialAccessoryGroupId = closestTr.getAttribute("data-oi-id")
-			var potentialAccessoryItemName = closestTr.querySelector("div.dd-content").innerText;
-			potentialAccessoryItemName = potentialAccessoryItemName.replace(/🔎/g, '');
-			potentialAccessoryItemName = potentialAccessoryItemName.trim();
-			console.log(potentialAccessoryGroupId);
-			console.log(potentialAccessoryItemName);
-			var potentialAssetIds = findAssetNumbersByItemName(potentialAccessoryItemName);
-			console.log(potentialAssetIds);
-			for (var j = 0; j < potentialAssetIds.length; j++) {
-				if (potentialAssetIds[j] != "Group Booking"){
+			if (childElements[i].innerText.trim() == "Group Booking") {
 
-					smartScanCandidates[potentialAssetIds[j]] = potentialAccessoryGroupId;
+				var closestTr = childElements[i].closest('tr');
+				var potentialAccessoryGroupId = closestTr.getAttribute("data-oi-id")
+				var potentialAccessoryItemName = closestTr.querySelector("div.dd-content").innerText;
+				potentialAccessoryItemName = potentialAccessoryItemName.replace(/🔎/g, '');
+				potentialAccessoryItemName = potentialAccessoryItemName.trim();
+				var potentialAssetIds = findAssetNumbersByItemName(potentialAccessoryItemName);
+				smartScanCandidateLines ++;
+
+				for (var j = 0; j < potentialAssetIds.length; j++) {
+					if (potentialAssetIds[j] != "Group Booking" && !assetsOnTheJob.includes(potentialAssetIds[j])){
+						smartScanCandidates[potentialAssetIds[j]] = potentialAccessoryGroupId;
+					}
 				}
+
+				// mark the reserved badge of this line as a candidate
+				const badgeCell = closestTr.querySelector("td.essential.status-column");
+				badgeCell.querySelector("span.label").classList.add("smart-scan-candidate");
 			}
 		}
 	}
-	console.log("Potenital SmartScan candidates:");
-	console.log(smartScanCandidates);
+
+	// If no hits, check if the asset scanned was a serialised container (like a flightcase that is an accessory to a main item, and that main item has further accessories)
+	if (Object.keys(smartScanCandidates).length === 0 && containerDataList.includes(assetScanned)){
+		console.log("Checking for further candidates...");
+		// work out if the item is now an accessory of another item
+		var containerTdElements = document.querySelectorAll("td.optional-01.container-column");
+
+		// Loop through the elements and find the one with the correct inner text
+		var desiredContainerTdElement = null;
+
+		for (var i = 0; i < containerTdElements.length; i++) {
+			if (containerTdElements[i].innerText.trim() == assetScanned) {
+				if (containerTdElements[i].closest("li").classList.contains("dd-haschildren")){
+					desiredContainerTdElement = containerTdElements[i].closest("li").querySelector("td.optional-01.asset.asset-column");
+					break; // Stop the loop once a match is found
+				}
+			}
+		}
+
+		if (desiredContainerTdElement){
+			const newAssetToCheck = desiredContainerTdElement.innerText.trim();
+			console.log("Propogating smart scan setup");
+			smartScanSetup(newAssetToCheck);
+			return;
+		}
+	}
+	if (Object.keys(smartScanCandidates).length > 0){
+		console.log("Potential SmartScan candidates:");
+		console.log(smartScanCandidates);
+
+		if (!isElementInViewport(parentRow)) {
+			console.log('Element is not visible on screen');
+			parentRow.scrollIntoView({
+				behavior: 'smooth',   // or 'auto' for instant
+				block: 'center',      // aligns element in the center vertically
+				inline: 'nearest'     // horizontal alignment
+			});
+
+		}
+
+
+	} else {
+		console.log("No smart scan candidates were found");
+	}
+
+
+	function isElementInViewport(el) {
+		const rect = el.getBoundingClientRect();
+		return (
+		  rect.top >= 0 &&
+		  rect.left >= 0 &&
+		  rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
+		  rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+		);
+	  }
+	  
+
+
+
+
+
 }
 
 
@@ -6402,9 +7291,12 @@ function removeAsset(assetToRemove){
 
 // section below is to deal with modifying the picker behaviour in regards to items spread across Pages
 if (orderView){
+	initialiseOrderPickerHandlers();
+}
 
+async function initialiseOrderPickerHandlers(){
 	// Select the target table you want to observe
-	const targetTable = document.querySelector('#picker_search_results'); // Replace '#myTable' with your actual table selector
+	const targetTable = await waitForOptionalElement('#picker_search_results', "order picker results", 15000); // Replace '#myTable' with your actual table selector
 
 
 
@@ -6443,21 +7335,34 @@ if (orderView){
 		observer.observe(targetTable, config);
 
 		// Define the function to handle table updates
-		function handleTableUpdate() {
-			// Your custom logic to handle the table update
-			console.log('Picker table content has been updated.');
-			// Perform your desired actions here
-			const pickerModal = document.getElementById('pickerModal');
+			function handleTableUpdate() {
+				// Your custom logic to handle the table update
+				console.log('Picker table content has been updated.');
+				// Perform your desired actions here
+				const pickerModal = document.getElementById('pickerModal');
+				if (!pickerModal){
+					logMissingElement("order picker update", "#pickerModal");
+					tableUpdated = false;
+					return;
+				}
 
-			var pickerBody = pickerModal.querySelector("tbody");
+				var pickerBody = pickerModal.querySelector("tbody");
+				if (!pickerBody){
+					logMissingElement("order picker update", "#pickerModal tbody");
+					tableUpdated = false;
+					return;
+				}
 
-			// set minimum of all number inputs to 0
-			if (pickerBody){
-					var allPickerRows = pickerBody.querySelectorAll("tr");
-					allPickerRows.forEach((item, i) => {
-					item.querySelector('input[type="number"]').min = "0";
-				});
-			}
+				// set minimum of all number inputs to 0
+				if (pickerBody){
+						var allPickerRows = pickerBody.querySelectorAll("tr");
+						allPickerRows.forEach((item, i) => {
+						const qtyInput = item.querySelector('input[type="number"]');
+						if (qtyInput){
+							qtyInput.min = "0";
+						}
+					});
+				}
 
 			let activePageLi = pickerModal.querySelector("li.active");
 
@@ -6479,16 +7384,20 @@ if (orderView){
 				// resurrect the previous rows so that we see the expanded accessories
 				pickerBody.innerHTML = pickerPageStorage.get(activePage);
 
-				var arrayOfPickedValues = pickerQtyMemory.get(activePage);
-				var allPickerRows = pickerBody.querySelectorAll("tr");
-				allPickerRows.forEach((item, i) => {
-					if (arrayOfPickedValues[i] > 0){
-						item.querySelector('input[type="number"]').value = arrayOfPickedValues[i];
-					} else {
-						item.querySelector('input[type="number"]').value = "";
-					}
-				});
-			}
+					var arrayOfPickedValues = pickerQtyMemory.get(activePage);
+					var allPickerRows = pickerBody.querySelectorAll("tr");
+					allPickerRows.forEach((item, i) => {
+						const qtyInput = item.querySelector('input[type="number"]');
+						if (!qtyInput){
+							return;
+						}
+						if (arrayOfPickedValues[i] > 0){
+							qtyInput.value = arrayOfPickedValues[i];
+						} else {
+							qtyInput.value = "";
+						}
+					});
+				}
 
 
 			// now add values from other pages to the bottom of this one.
@@ -6522,13 +7431,16 @@ if (orderView){
 
 				var rowsToAdd = temp.querySelectorAll('tr');
 
-				if (rowsToAdd){
-					rowsToAdd.forEach((rowToAdd, i) => {
+					if (rowsToAdd){
+						rowsToAdd.forEach((rowToAdd, i) => {
 
-						pickerBody.appendChild(rowToAdd);
-						rowToAdd.querySelector('input[type="number"]').value = valuesToAdd[i];
-						rowToAdd.dataset.additional = 'true';
-						rowToAdd.style.display = "none";
+							pickerBody.appendChild(rowToAdd);
+							const qtyInput = rowToAdd.querySelector('input[type="number"]');
+							if (qtyInput){
+								qtyInput.value = valuesToAdd[i];
+							}
+							rowToAdd.dataset.additional = 'true';
+							rowToAdd.style.display = "none";
 
 					});
 				}
@@ -6547,7 +7459,7 @@ if (orderView){
 
 
 		// Select the pickerModal element
-	const pickerModal = document.getElementById('pickerModal');
+	const pickerModal = await waitForOptionalElement('#pickerModal', "order picker modal", 15000);
 
 	// Check if the element exists to avoid errors
 	if (pickerModal) {
@@ -6570,22 +7482,30 @@ if (orderView){
 		});
 
 		// Define the function to handle the valid <a> click
-		function handleValidLinkClick(linkElement) {
+			function handleValidLinkClick(linkElement) {
 
-			// work out the current page:
-			let activePage = pickerModal.querySelector("li.active").innerText;
+				// work out the current page:
+				const activePageLi = pickerModal.querySelector("li.active");
+				if (!activePageLi){
+					return;
+				}
+				let activePage = activePageLi.innerText;
 
 			let arrayOfrows = [];
 			let arrayOfValues = [];
 			let arrayOfChosenValues = [];
 
-			// Log any values entered:
-			var pickerBody = pickerModal.querySelector("tbody");
-			var allPickerRows = pickerBody.querySelectorAll("tr");
-			console.log(allPickerRows.length);
-			allPickerRows.forEach((item, i) => {
-					if (item.dataset.additional != 'true'){
-					var inputQty = item.querySelector('input[type="number"]').value;
+				// Log any values entered:
+				var pickerBody = pickerModal.querySelector("tbody");
+				if (!pickerBody){
+					return;
+				}
+				var allPickerRows = pickerBody.querySelectorAll("tr");
+				console.log(allPickerRows.length);
+				allPickerRows.forEach((item, i) => {
+						if (item.dataset.additional != 'true'){
+						const qtyInput = item.querySelector('input[type="number"]');
+						var inputQty = qtyInput ? qtyInput.value : "";
 					if (parseInt(inputQty) > 0){
 						arrayOfrows.push(item.outerHTML);
 						arrayOfValues.push(inputQty);
@@ -7525,3 +8445,1065 @@ function createTopAlert(type, message, code){
 	linksBar.style.marginTop = '6px';
 
 };
+
+function getStockByScan(scanCode) {
+	return allStock.stock_levels.find(s => s.asset_number === scanCode || s.asset_number === scanCode.trim());
+}
+
+
+
+  
+
+// SMART SCAN FUNCTION
+async function handleSmartScan(scanCode, targetItemId, stockLevelId, assetNumber) {
+	try {
+		// 1. Allocate asset to the specific opportunity item
+		const { doc, form } = await fetchEditFormForItem(targetItemId);
+		addItemAssetToForm(doc, form, stockLevelId);
+		const start = performance.now();
+		const html = await submitPatchedForm(form);
+		console.log(`Smart Scan Allocation patch took ${(performance.now() - start).toFixed(2)} ms`);
+		// 2. Check for allocation errors before proceeding
+		if (!html) {
+			console.warn("SmartScan: empty response from allocation, skipping quick prepare");
+			makeToast("toast-error", "Failed to allocate asset(s)");
+			return;
+		}
+
+		//console.log(html);
+
+		// Already on job
+		if (html.includes("has been selected more than once")) {
+		console.log(
+			"SmartScan: allocation error – asset has been selected more than once. Skipping quick prepare."
+		);
+		makeToast("toast-error", "Failed to allocate asset(s)");
+		makeToast("toast-error", `No available asset could be found using '${assetNumber}' for the bookings that can be allocated`);
+		return;
+		}
+
+		// Catch error of mandatory inspection due
+		if (html.includes("is due mandatory inspection")) {
+
+			function extractInspectionToast(html) {
+				// Find the toastr.error("...") block
+				const match = html.match(/toastr\.error\("([\s\S]+?)"\);/);
+				if (!match) return null;
+			  
+				// 2. Unescape the JS string a bit (enough for this case)
+				let toastHtml = match[1]
+				  .replace(/\\'/g, "'")
+				  .replace(/\\"/g, '"')
+				  .replace(/\\\//g, "/");
+			  
+				// Parse the HTML fragment
+				const parser = new DOMParser();
+				const frag = parser.parseFromString(toastHtml, "text/html");
+			  
+				const ulElement = frag.querySelector("ul");
+				return ulElement ? ulElement.outerHTML : null;
+			  }
+			  
+			const inspectionToast = extractInspectionToast(html);
+			
+			console.log("SmartScan: allocation error – mandatory inspection is due before or during the opportunity. Skipping quick prepare.");
+			makeToast("toast-error", "Failed to allocate asset(s)");
+			if (inspectionToast){
+				makeToast("toast-error", `${inspectionToast}`);
+			}
+			return;
+		}
+
+		// Catch warning of non-mandatory inspection due
+		if (html.includes("before or during the opportunity")) {
+
+			function extractInspectionToast(html) {
+				// Find the toastr.error("...") block
+				const match = html.match(/toastr\.warning\("([\s\S]+?)"\);/);
+				if (!match) return null;
+			  
+				// 2. Unescape the JS string a bit (enough for this case)
+				let toastHtml = match[1]
+				  .replace(/\\'/g, "'")
+				  .replace(/\\"/g, '"')
+				  .replace(/\\\//g, "/");
+			  
+				// Parse the HTML fragment
+				const parser = new DOMParser();
+				const frag = parser.parseFromString(toastHtml, "text/html");
+			  
+				const ulElement = frag.querySelector("ul");
+				return ulElement ? ulElement.outerHTML : null;
+			  }
+			  
+			const inspectionToast = extractInspectionToast(html);
+			
+			console.log("SmartScan: allocation warning – non-mandatory inspection is due before or during the opportunity.");
+			if (inspectionToast){
+				makeToast("toast-warning", `${inspectionToast}`);
+			}
+		}
+
+		if (html.includes("The number of allocations must match the item quantity.")){
+			console.log("SmartScan: Tried to allocate to a candidate, but the allocations were already full.");
+			makeToast("toast-error", "Failed to allocate asset(s)");
+			makeToast("toast-error", "SmartScan could not allocate the asset.");
+			return;
+
+		}
+
+		
+
+		// Catch other errors
+		if (html.includes("Please correct the following errors")) {
+			console.log("SmartScan: allocation returned validation errors. Skipping quick prepare.");
+			makeToast("toast-error", "Failed to allocate asset(s)");
+			console.log(html);
+			return;
+		}
+  
+	  	// If no errors, Quick-prepare that asset and update its row in the table
+	  	await quickPrepareAsset(assetNumber || scanCode, stockLevelId);
+	  	listAssets();
+  
+		console.log(`SmartScan: ${assetNumber || scanCode} → item ${targetItemId} (allocated + quick prepared)`);
+		makeToast("toast-success", "Allocation successful", 5);
+	  
+	} catch (err) {
+	  	console.error("Smart scan allocation + quick_prepare failed:", err);
+	}
+}
+  
+  
+  
+
+  // Fetch the edit form HTML for the opportunity item
+  async function fetchEditFormForItem(opportunityItemId) {
+	const resp = await fetch(`/opportunity_items/${opportunityItemId}/edit`, {
+	  credentials: "include"
+	});
+	if (!resp.ok) throw new Error(`Edit form fetch failed: ${resp.status}`);
+  
+	const html = await resp.text();
+	const doc = new DOMParser().parseFromString(html, "text/html");
+	const form = doc.querySelector("form.edit_opportunity_item.simple_form");
+	if (!form) throw new Error("Edit form not found in fetched HTML");
+  
+	return { doc, form };
+  }
+  
+  // Inject a new item_assets_attributes row for this stock_level_id
+  function addItemAssetToForm(doc, form, stockLevelId) {
+	// timestamp as index
+	const idx = Date.now().toString(); 
+  
+	const container = doc.createElement("div");
+
+	const containerInput = document.querySelector('input[type="text"][name="container"]');
+	const containerScanValue = containerInput ? containerInput.value : "";
+  
+	container.innerHTML = `
+	  <input type="hidden"
+			 name="opportunity_item[item_assets_attributes][${idx}][form_index]"
+			 value="${idx}">
+	  <input type="hidden"
+			 name="opportunity_item[item_assets_attributes][${idx}][stock_level_id]"
+			 value="${stockLevelId}">
+	  <input type="hidden"
+			 name="opportunity_item[item_assets_attributes][${idx}][supplier_id]"
+			 value="">
+	  <input type="text"
+			 name="opportunity_item[item_assets_attributes][${idx}][supplier_name]"
+			 value="">
+	  <input type="text"
+			 name="opportunity_item[item_assets_attributes][${idx}][container]"
+			 value="${containerScanValue}">
+	  <input type="text"
+			 name="opportunity_item[item_assets_attributes][${idx}][quantity]"
+			 value="1">
+	  <input type="hidden"
+			 name="opportunity_item[item_assets_attributes][${idx}][_destroy]"
+			 value="false">
+	`;
+  
+	form.appendChild(container);
+  }
+  
+  
+  // Submit the form as a PATCH to Current RMS
+  async function submitPatchedForm(form) {
+	const url = form.action;
+	const token =
+	  form.querySelector("input[name='authenticity_token']")?.value ||
+	  document.querySelector("meta[name='csrf-token']")?.content;
+  
+	const formData = new FormData(form);
+	if (!formData.get("_method")) formData.set("_method", "patch");
+  
+	const body = new URLSearchParams(formData);
+  
+	const resp = await fetch(url, {
+	  method: "POST",
+	  credentials: "include",
+	  headers: {
+		"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+		"X-CSRF-Token": token
+	  },
+	  body: body.toString()
+	});
+  
+	if (!resp.ok) {
+	  throw new Error(`PATCH failed: ${resp.status}`);
+	}
+  
+	const html = await resp.text();
+	return html;
+  }
+  
+  
+
+  async function quickPrepareAsset(assetNumber, stockLevelId) {
+	const form = document.querySelector("form#quick_prepare");
+	if (!form) {
+	  console.warn("quick_prepare form not found on this page");
+	  return;
+	}
+  
+	const url =
+	  form.action ||
+	  `/opportunities/${form.querySelector("#opportunity_id")?.value}/quick_prepare`;
+  
+	const token =
+	  form.querySelector("input[name='authenticity_token']")?.value ||
+	  document.querySelector("meta[name='csrf-token']")?.content;
+  
+	const formData = new FormData(form);
+	formData.set("p_stock_level_asset_number", assetNumber);
+	if (stockLevelId) {
+	  formData.set("p_stock_level_id", String(stockLevelId));
+	}
+  
+	const body = new URLSearchParams(formData);
+  
+	const resp = await fetch(url, {
+	  method: "POST",
+	  credentials: "include",
+	  headers: {
+		"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+		"X-CSRF-Token": token
+	  },
+	  body: body.toString()
+	});
+  
+	if (!resp.ok) {
+	  console.error("quick_prepare failed:", resp.status);
+	  return;
+	}
+  
+	const text = await resp.text();
+	applyQuickPrepareResponse(assetNumber, text, stockLevelId);
+  }
+  
+  
+  
+  function applyQuickPrepareResponse(assetNumber, jsText, stockLevelId) {
+	try {
+	  const htmlMatch = jsText.match(/list_item_from_asset\("([\s\S]*?)"\);/);
+	  if (!htmlMatch) {
+		console.warn("quick_prepare response: could not find list_item_from_asset(...)");
+		return;
+	  }
+  
+	  const escaped = htmlMatch[1];
+  
+	  const liHtml = escaped
+		.replace(/\\\\/g, "\\")
+		.replace(/\\n/g, "\n")
+		.replace(/\\t/g, "\t")
+		.replace(/\\\//g, "/")
+		.replace(/\\"/g, "\"")
+		.replace(/\\'/g, "'");
+  
+	  const temp = document.createElement("div");
+	  temp.innerHTML = liHtml;
+	  console.log(liHtml);
+  
+	  const newLi = temp.querySelector("li[data-item-id]");
+	  if (!newLi) {
+		console.warn("quick_prepare: no <tr data-oi-id> found in new HTML");
+		return;
+	  }
+  
+	  const oiId = newLi.getAttribute("data-item-id");
+  
+	  // check asset number in new row matches what we expect
+	  const newCheckbox = newLi.querySelector("input.item-select[data-asset-number]");
+	  const newAssetNum = newCheckbox?.getAttribute("data-asset-number") || null;
+	  if (newAssetNum && assetNumber && newAssetNum !== assetNumber) {
+		console.warn(
+		  "quick_prepare: assetNumber mismatch; response has",
+		  newAssetNum,
+		  "but we expected",
+		  assetNumber
+		);
+	  }
+  
+	  console.log(oiId);
+	  // find li row for this opportunity item
+	  let targetLi = null;
+	  if (oiId) {
+		targetLi = document.querySelector(`li[data-item-id="${oiId}"]`);
+	  }
+  
+	  if (targetLi && targetLi.parentNode) {
+		// Insert after the group booking row
+		targetLi.parentNode.insertBefore(newLi, targetLi.nextSibling);
+
+		// check quantity of the existing row
+		let lineQuantity = targetLi.querySelector("td.quantity-column").innerText.trim();
+		if (parseInt(lineQuantity) < 2){
+			console.log("Row removed at: " + new Date().toISOString());
+			targetLi.remove();
+		} else {
+			targetLi.querySelector("td.quantity-column").innerText = lineQuantity - 1;
+		}
+
+	  } else {
+		// Fallback: append to the first relevant tbody we can find
+		const tbody =
+		  document.querySelector("#nestable-grid tbody") ||
+		  document.querySelector("#opportunity_item_scrollable tbody") ||
+		  document.querySelector("tbody");
+		if (tbody) {
+		  tbody.appendChild(newLi);
+
+		} else {
+		  console.warn("quick_prepare: could not find a tbody to insert new row into");
+		}
+	  }
+	} catch (err) {
+	  console.error("Error applying quick_prepare response:", err);
+	}
+  }
+  
+  async function crossScanModal1(){
+
+	let assetsToXScan = [];
+
+	// Find the <ol> with id "opportunity_item_assets_body"
+	var opportunityList = document.getElementById("opportunity_item_assets_body");
+	// Check if the list exists
+	if (opportunityList) {
+
+		// Get all trs in the document
+		var trs = opportunityList.querySelectorAll('tr');
+		for (var n = 0; n < trs.length; n++) {
+
+			const checkBox = trs[n].querySelector("input[type='checkbox']");
+			if (checkBox && checkBox.checked){
+
+				const status = trs[n].querySelector("td.status-column").innerText.trim();
+				if (status == "Booked Out"){
+					var trAssetCells = trs[n].querySelectorAll('.asset-column');
+					for (var s = 0; s < trAssetCells.length; s++) {
+						const thisValue = trAssetCells[s].innerText;
+						
+						if (
+							thisValue.includes('Bulk Stock') ||
+							thisValue.includes('Non-Stock Booking') ||
+							thisValue.includes('Asset Number') ||
+							thisValue.includes('Sub-Rent Booking') ||
+							thisValue.includes('Group Booking') ||
+							thisValue.includes('Asset Number') ||
+							thisValue==""
+						){
+							// ignore these
+						} else {
+							assetsToXScan.push(thisValue);
+						}
+					}
+				}
+			}
+			
+		}
+	} else {
+		return;
+	}
+
+	if (assetsToXScan.length < 1){
+		alert ("No valid items selected! Assets must be Booked Out before transfer");
+		return;
+	}
+
+
+	const { doc, table } = await fetchOrders();
+
+	console.log(table);
+
+	const tBods = table.querySelectorAll("tbody");
+
+	let oppsToList = [];
+	let oppsToIdList = [];
+
+	tBods.forEach(tBod => {
+		const thisId = tBod.querySelector("tr").id;
+
+		oppsToIdList.push(thisId.split("-")[1]);
+		const title = tBod.querySelector("a.title").innerText.trim();
+		const start = tBod.querySelector("time").innerText.trim();
+		oppsToList.push("<strong>"+title+"</strong> "+start);
+	});
+
+	console.log(oppsToList);
+
+	const newElement = document.createElement('div');
+	newElement.classList.add("modal", "cross-scan-modal");
+	newElement.id = "crossscan-modal-1";
+	newElement.style = "display: block;";
+	let newHtml = `
+		<div class="modal-dialog set-description-modal">
+		<div class="modal-content">
+		<div class="modal-header clearfix">
+		<button class="helper-close cross-scan-close">×</button>
+		<h4 class="modal-title">
+		<i class="icn-cobra-shuffle"></i>
+		Select Target Opportunity for Cross Scan
+		</h4>
+		</div>
+		<div class="form-page form-modal">
+		<form id="cross-scan">
+		<div class="modal-body">
+		<div class="row form-block">
+
+		<div class="col-md-12 col-sm-12 form-area">
+			<div class="row">
+				<div class="col-md-12 col-sm-12">
+					<label for="warehouse_note">Choose Target Opportunity:</label>`;
+		
+	for (let i = 0; i < oppsToList.length; i++) {
+		newHtml += `<div data-opp="${oppsToIdList[i]}" class="cross-scan-option">${oppsToList[i]}</div>`
+	}
+
+	newHtml +=`</div>
+		</div>
+		</div>
+		</div>
+
+		<div class="modal-footer">
+		<div class="button-row">
+		<button class="cross-scan-close btn btn-default" id="">Cancel</button>
+		</div>
+		</div>
+		</form>
+
+		</div>
+		</div>
+		</div>`;
+
+	newElement.innerHTML = newHtml;
+	document.body.prepend(newElement);
+
+	newElement.addEventListener("click", function(event) {
+		const targetDiv = event.target.closest('div[data-opp]');
+		if (targetDiv) {
+			crossScanConfirm(targetDiv.getAttribute('data-opp'), targetDiv.innerText, assetsToXScan);
+			newElement.remove();
+		} else if (event.target.classList.contains("cross-scan-close")){
+			event.preventDefault();
+			newElement.remove();
+		}
+	});
+  }
+
+
+function crossScanConfirm(targetId, targetText, items){
+	const newElement = document.createElement('div');
+	newElement.classList.add("modal", "cross-scan-modal");
+	newElement.id = "crossscan-modal-1";
+	newElement.style = "display: block;";
+	let newHtml = `
+		<div class="modal-dialog set-description-modal">
+		<div class="modal-content">
+		<div class="modal-header clearfix">
+		<button class="helper-close cross-scan-close">×</button>
+		<h4 class="modal-title">
+		<i class="icn-cobra-shuffle"></i>
+		Confirm Cross Scan
+		</h4>
+		</div>
+		<div class="form-page form-modal">
+		<form id="cross-scan">
+		<div class="modal-body">
+		<div class="row form-block">
+
+		<div class="col-md-12 col-sm-12 form-area">
+			<div class="row">
+				<div class="col-md-12 col-sm-12">
+					<div class="cross-scan-warning">
+					You are about to cross scan:<br>
+					<span class="cross-scan-target">${items.length} assets</span><br>to the opportunity:<br>
+					<span class="cross-scan-target">${targetText}</span><p>
+					Are you sure?
+				</div>
+		</div>
+		</div>
+		</div>
+
+		<div class="modal-footer">
+		<div class="button-row">
+		<button class="cross-scan-confirm btn btn-primary" id="cross-scan-confirm">Confirm</button>
+		<button class="cross-scan-close btn btn-default" id="">Cancel</button>
+		</div>
+		</div>
+		</form>
+
+		</div>
+		</div>
+		</div>`;
+
+	newElement.innerHTML = newHtml;
+	document.body.prepend(newElement);
+
+	newElement.addEventListener("click", function(event) {
+		const confirmButton = event.target.closest('button.cross-scan-confirm');
+		if (confirmButton) {
+			event.preventDefault();
+			chrome.storage.local.set({ 'cross-scan-payload': {items: items, source: opportunityID}}).then(() => {
+				window.location.href = `/opportunities/${targetId}?view=d&crossscanning=true`;
+
+				
+		   });
+		} else if (event.target.classList.contains("cross-scan-close")){
+			event.preventDefault();
+			newElement.remove();
+		}
+	});
+}
+
+
+
+// Fetch the edit form HTML for the opportunity item
+async function fetchOrders() {
+	const resp = await fetch(`/opportunities?utf8=%E2%9C%93&per_page=48&view_id=0&filtermode%5B%5D=live&filtermode%5B%5D=orders#`, {
+		credentials: "include"
+	});
+	if (!resp.ok) throw new Error(`Edit form fetch failed: ${resp.status}`);
+	
+	const html = await resp.text();
+	const doc = new DOMParser().parseFromString(html, "text/html");
+	const table = doc.querySelector("table.index-table");
+	if (!table) throw new Error("Table not found in fetched HTML");
+	return { doc, table };
+}
+
+	
+async function executeCrossScan(){
+	crossScanOverlay();
+	setTimeout(function () {
+		chrome.storage.local.get(["cross-scan-payload"]).then((result) => {
+			const payload = result["cross-scan-payload"];
+			if (!payload) {
+				document.getElementById("crossscanoverlay")?.remove();
+				return;
+			}
+
+			let assetsToX = payload.items.slice(); // copy, just in case
+			let xSource   = payload.source;
+
+			const scanInput  = document.getElementById("stock_level_asset_number");
+			const scanButton = document.querySelector("input[value='allocate']");
+			document.getElementById("container").value = "Xscanned from " + xSource;
+
+			function processNext() {
+				if (assetsToX.length === 0) {
+					chrome.storage.local.remove(["cross-scan-payload"]);
+					document.getElementById("crossscanoverlay").remove();
+					document.getElementById("container").value = "";
+					return;
+				}
+
+				const thisItem = assetsToX.shift();
+				scanInput.value = thisItem;
+				
+				// click, then wait a bit for the page to react
+				scanButton.click();
+
+				setTimeout(processNext, 500); // schedule next item
+			}
+
+			processNext();
+		});
+	}, 1000);
+}
+
+
+function crossScanOverlay() {
+	var overlay = document.createElement('div');
+	overlay.className = 'block-out';
+	var text = document.createElement('span');
+	text.textContent = 'CROSS SCAN IS IN PROGRESS! PLEASE WAIT...';
+	overlay.appendChild(text);
+	overlay.id="crossscanoverlay";
+	document.body.appendChild(overlay);
+
+}
+
+
+async function listContainerAccessories(){
+
+
+	const ghostCheck = await chrome.storage.local.get(["ghost-containers"]);
+
+
+	if (ghostCheck["ghost-containers"] !== true){
+
+		// Turned off, so tidy up any existing rows and return
+
+		const tbody = document.querySelector("#serialised_components_body");
+		// Loop through each row
+		tbody.querySelectorAll("tr").forEach(row => {
+
+			// if it's an existing ghost row, remove it
+			if (row.classList.contains("ghost-accessory")){
+				row.remove();
+			}
+		});
+		return;
+	}
+
+	const containerID = document.querySelector("div.subtitle").innerText.trim();
+
+	if (!containerID){
+		return;
+	}
+
+	const thisAssetStock = allStock.stock_levels.find(item => item.asset_number === containerID);
+	if (thisAssetStock){
+		const thisProduct = allProducts.products.find(product => product.id === thisAssetStock.item_id);
+		var parentMatches = null;
+
+		if (thisProduct){
+			console.log(thisProduct);
+
+			// Get a list of the products already in the list
+			
+			// Select the table body
+			const tbody = document.querySelector("#serialised_components_body");
+
+			// Initialize result object
+			const productQuantities = {};
+
+			// Loop through each row
+			tbody.querySelectorAll("tr").forEach(row => {
+
+				// if it's an existing ghost row, remove it
+				if (row.classList.contains("ghost-accessory")){
+					row.remove();
+				} else {
+					// Find the product link (href containing '/products/')
+					const productLink = row.querySelector('td.essential a[href*="/products/"]');
+					if (!productLink) return; // skip if no product link found
+
+					const productName = productLink.textContent.trim();
+
+					// Get the 4th TD element (the quantity)
+					const quantityCell = row.querySelectorAll("td")[3];
+					const quantity = quantityCell ? parseInt(quantityCell.textContent.trim(), 10) || 0 : 0;
+
+					// Add or increment the quantity in the object
+					if (productQuantities[productName]) {
+						productQuantities[productName] += quantity;
+					} else {
+						productQuantities[productName] = quantity;
+					}
+				}
+			});
+
+			console.log(productQuantities);
+
+
+
+			if (thisProduct.accessories.length > 0){
+				// base the list on this container items accessories
+				//parentItem = thisProduct;
+				parentMatches = [thisProduct];
+			} else {
+				// The container has no accessories, so the case is an accessory
+				// We need to find the base item that lists this case as an accessory
+				// find the product that lists this item as it's accessory
+				console.log(containerID);
+				const theProducts = allProducts.products;
+				parentMatches =  theProducts.filter(theProduct => 
+					Array.isArray(theProduct.accessories) &&
+					theProduct.accessories.some(accessory => 
+					  accessory.item &&
+					  accessory.item.id === thisProduct.id &&
+					  accessory.item.active === true
+					)
+				);
+
+				if (parentMatches){
+					console.log(parentMatches);
+					
+					if (parentMatches.length < 1){
+						return;
+					}
+				
+				} else {
+					return;
+				}
+			}
+
+			parentMatches.forEach((match) => {
+
+				const parentItem = match;
+
+				const accessoriesToCase = parentItem.accessories;
+				var accessoryMultiplier = 0;
+				var parentQuantity = 1;
+
+				if (parentItem == thisProduct){
+					accessoryMultiplier = 1;
+					parentQuantity = 1;
+				} else {
+							
+					// find the original item
+					accessoriesToCase.forEach((item, i) => {
+						if (item.item.id == thisProduct.id){
+							// accessory matches the container
+							console.log("Container Item is:");
+							console.log(item);
+							accessoryMultiplier = parseFloat(item.quantity);
+							console.log(accessoryMultiplier);
+						}
+					});
+
+					if (accessoryMultiplier == 0){
+						console.log("Error, accessory multiplier was 0");
+						return;
+					}
+
+					// work out how many of the parent item are needed to get to 1 of the container item
+					parentQuantity = Math.floor(1 / accessoryMultiplier);
+				}
+
+				let accessoriesToList = [];
+
+				if (parentItem != thisProduct){
+					// add the parent item if it isn't the container itself
+					accessoriesToList.push({name: parentItem.name, quantity: parentQuantity, product: parentItem.id});
+				}
+
+				console.log("Default items:");
+				accessoriesToCase.forEach((item, i) => {
+					if (item.inclusion_type < 2) {
+						if (item.related_id != thisProduct.id) {
+							// means this is a default or mandatory item
+							console.log(item);
+				
+							const baseQty = parseFloat(item.quantity) * parentQuantity;
+				
+							// push the direct accessory
+							accessoriesToList.push({
+								name: item.related_name,
+								quantity: baseQty,
+								product: item.related_id,
+								depth: 0
+							});
+				
+							// check if the accessory has default accessories we should add
+							const nestedAccessories = returnArrayOfAccessories(item.related_id, 0);
+				
+							nestedAccessories.forEach(nested => {
+								accessoriesToList.push({
+									name: nested.name,
+									// baseQty (from parent) × nested quantity at its own level
+									quantity:  Math.ceil(baseQty * (nested.quantity || 1)),
+									product: nested.id,
+									depth: nested.depth
+								});
+							});
+						}
+					}
+				});
+				
+
+				console.log(accessoriesToList);
+
+				function adjustRequired(existing, required) {
+					const usedNames = new Set();
+				  
+					return required.map(item => {
+					  const already = existing[item.name] || 0;
+				  
+					  // Only subtract 'already' the first time we see this name
+					  if (!usedNames.has(item.name) && already !== 0) {
+						usedNames.add(item.name);
+						return {
+						  ...item,
+						  quantity: item.quantity - already  // can go negative
+						};
+					  }
+				  
+					  // Subsequent entries with the same name are left as-is
+					  return { ...item };
+					});
+				}
+				  
+
+				accessoriesToList = adjustRequired(productQuantities, accessoriesToList);
+
+				const currentUrl = window.location.href;
+				const contId = currentUrl.match(/\/serialised_containers\/(\d+)/);
+				const rpUrl = match ? `?rp=%2Fserialised_containers%2F${contId[1]}` : "";
+
+
+				if (accessoriesToList.filter(item => item.quantity !== 0).length == 0){
+					let noteRow = document.createElement('tr');
+					noteRow.classList.add("ghost-accessory");
+					noteRow.innerHTML = `
+					<td colspan=7 class="essential ghost-note ghost-good">Accessories are present and correct based on <a class="ghost-accessory ghost-good" href="/products/${parentItem.id}${rpUrl}">${parentItem.name}</a></td>`;
+					tbody.appendChild(noteRow);
+					return;
+				}
+
+
+				let noteRow = document.createElement('tr');
+				noteRow.classList.add("ghost-accessory")
+				noteRow.innerHTML = `
+				<td colspan=7 class="essential ghost-note">Potentially missing or overloaded components based on <a class="ghost-accessory" href="/products/${parentItem.id}${rpUrl}">${parentItem.name}</a>:</td>`;
+				tbody.appendChild(noteRow);
+
+				
+
+
+				accessoriesToList.forEach((item) => {
+					if (item.quantity != 0){
+						let newRow = document.createElement('tr');
+
+						const spacerString = '&nbsp;&nbsp;&nbsp;&nbsp;↳&nbsp;'.repeat(item.depth);
+
+						newRow.classList.add("ghost-accessory")
+						newRow.innerHTML = `
+						<td class="essential"></td>
+						<td class="optional-02"></td>
+						<td class="essential">${spacerString}<a class="ghost-accessory" href="/products/${item.product}${rpUrl}">${item.name}</a>
+						</td>
+						<td class="essential">${item.quantity}</td>
+						<td class="optional-01">${item.quantity < 0 ? "Too many?" : ""}</td>
+						<td class="optional-01"></td>
+						<td class="essential action-menu">
+						</td>`;
+						tbody.appendChild(newRow);
+					}
+				});
+
+			});
+					
+		}
+	}  
+}
+
+
+
+// Helper function
+function returnArrayOfAccessories(productId, depth, visited = new Set()) {
+	// avoid infinite loops if there are cycles
+	if (visited.has(productId)) return [];
+	visited.add(productId);
+
+	const product = allProducts.products.find(p => p.id == productId);
+	if (!product || !Array.isArray(product.accessories)) {
+		return [];
+	}
+
+	let accessoriesFound = [];
+
+	console.log(product);
+
+	product.accessories.forEach(accessory => {
+		if (
+			accessory.item &&
+			accessory.item.active === true &&
+			accessory.inclusion_type < 2
+		) {
+			// capture both the product and its own accessory quantity
+			accessoriesFound.push({
+				id: accessory.item.id,
+				name: accessory.item.name,
+				quantity: parseFloat(accessory.quantity) || 1,
+				depth: depth + 1
+			});
+
+			// recurse to get *its* accessories
+			const deeper = returnArrayOfAccessories(accessory.item.id, depth, visited);
+			accessoriesFound = accessoriesFound.concat(deeper);
+		}
+	});
+	console.log(productId);
+	console.log(accessoriesFound);
+	return accessoriesFound;
+}
+
+
+async function enableContainerGhosting(){
+	var ghostContainers = false;
+	const ghostAnswer = await chrome.storage.local.get(["ghost-containers"]);
+		if (ghostAnswer["ghost-containers"] && ghostAnswer["ghost-containers"] == true){
+			ghostContainers = true;
+		}
+
+		const ghostToggle = document.createElement('div');
+		ghostToggle.classList.add("ghost-components-toggle", "col-md-3", "col-sm-3");
+		ghostToggle.id = "ghost-toggle";
+		ghostToggle.innerHTML = `
+				<label for="smart_scan">Show Matched Components</label>
+				<label class="checkbox toggle android" for="ghost_components">
+				<input name="smart_scan" type="hidden" value="0" id="ghost-components-button">
+				<input class="boolean optional" id="ghost_components" name="ghost_components" type="checkbox" value="1" ${ghostContainers ? "checked" : ""}>
+				<p>
+					<span class="checkedtext" data-text="yes"></span>
+					<span class="uncheckedtext" data-text="no"></span>
+				</p>
+				<a class="slide-button"></a>
+				</label>`;
+
+		function waitForElementByClass(selector, timeout = 5000) {
+			return new Promise((resolve, reject) => {
+			  const existing = document.querySelector(selector);
+			  if (existing) return resolve(existing);
+			  const observer = new MutationObserver(() => {
+				const el = document.querySelector(selector);
+				if (el) {
+				  observer.disconnect();
+				  resolve(el);
+				}
+			  });
+		  
+			  observer.observe(document.documentElement, { childList: true, subtree: true });
+		  
+			  if (timeout) {
+				setTimeout(() => {
+				  observer.disconnect();
+				  reject(new Error(`Element with class ${selector} not found within ${timeout}ms`));
+				}, timeout);
+			  }
+			});
+		}
+
+
+		try {
+			//const containerModeToggle = await waitForElementByClass("div.stock_level_container_mode");
+
+			var containerModeToggle = document.querySelector("div.stock_level_container_mode");
+
+			if (!containerModeToggle){
+				containerModeToggle = document.querySelector("div.serialised_container_container_mode");
+			}
+
+			console.log("Found it:", containerModeToggle);
+
+			//const containerModeToggle = containerModeDiv.querySelector(".stock_level_container_mode");
+
+			if (containerModeToggle){
+				containerModeToggle.style.minWidth = "140px";
+				containerModeToggle.parentElement.style.display = "flex";
+				containerModeToggle.parentElement.style.justifyContent = "space-between";
+				containerModeToggle.insertAdjacentElement('afterend', ghostToggle);
+				console.log("BLAH 3");
+			}
+	
+			
+		
+			const ghostCheck = document.getElementById("ghost_components");
+	
+			if (ghostCheck) {
+				console.log("BLAH 4") + ghostCheck;
+		
+				ghostCheck.addEventListener("change", function () {
+					if (this.checked) {
+						console.log("Ghost components: ON");
+						chrome.storage.local.set({ ["ghost-containers"]: true });
+					} else {
+						console.log("Ghost components: OFF");
+						chrome.storage.local.set({ ["ghost-containers"]: false });
+					}
+					listContainerAccessories();
+				});
+				listContainerAccessories();
+			}
+		  } catch (e) {
+			console.warn(e.message);
+		  }
+
+
+}
+
+
+function containerEditAddWeightData(){
+
+	// REMOVE EXISTING ELEMENTS IF THEY EXIST
+	const ctw = document.getElementById("container-total-weight");
+	const ccw = document.getElementById("container-contents-weight");
+	const csw = document.getElementById("container-self-weight");
+
+	if (ctw){
+		ctw.remove();
+	}
+	if (ccw){
+		ccw.remove();
+	}
+
+	if (csw){
+		csw.remove();
+	}
+
+	let thisContainerWeight = 0;
+	let thisContainerSelfWeight = 0;
+	let thisContainerTotalWeight = 0;
+
+	const containerID = document.querySelector("div.subtitle").innerText.trim();
+
+	if (containerID){
+		const thisContainer = allStock.stock_levels.find(item => item.asset_number === containerID);
+		if (thisContainer){
+			thisContainerSelfWeight = parseFloat(thisContainer.item.weight);
+			thisContainerSelfWeight = Math.round(thisContainerSelfWeight * 100) / 100;
+		}
+	}
+
+
+	const serialisedComponentsBody = document.getElementById('serialised_components_body');
+	if (serialisedComponentsBody){
+		const serialisedComponentRows = serialisedComponentsBody.querySelectorAll('tr');
+		serialisedComponentRows.forEach((row, i) => {
+			const assetNumber = row.querySelector('td.essential').innerText.trim();
+			const thisItem = allStock.stock_levels.find(item => item.asset_number === assetNumber);
+			if (thisItem){
+				const thisWeight = thisItem.item.weight;
+				if (thisWeight && thisWeight != null){
+					thisContainerWeight = thisContainerWeight + parseFloat(thisWeight);
+				}
+			}
+			
+		});
+		// rounding to fix float issues
+		thisContainerWeight = Math.round(thisContainerWeight * 100) / 100;
+
+		thisContainerTotalWeight = Math.round((thisContainerWeight + thisContainerSelfWeight) * 100) / 100;
+
+
+		console.log("Container weight: "+thisContainerWeight);
+		console.log("Container self weight: "+thisContainerSelfWeight);
+		console.log("Total weight: "+thisContainerTotalWeight);
+
+		// add info to the side bar
+		const attributeList = document.querySelector("ul.number-list");
+		const newHtml = `
+		<li id="container-total-weight"><span>Container Total Weight: ${thisContainerTotalWeight} ${weightUnit}</span></li>
+		<li id="container-contents-weight"><span><i>&#8627; Container Contents: ${thisContainerWeight} ${weightUnit}</i></span></li>
+		<li id="container-self-weight"><span><i>&#8627; Container Item Self Weight: ${thisContainerSelfWeight} ${weightUnit}</i></span></li>
+		`;
+		attributeList.insertAdjacentHTML('beforeend', newHtml);
+	}
+}
