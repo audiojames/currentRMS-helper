@@ -37,7 +37,7 @@
       "https://*.current-rms.com/global_check_in?autocheckin&*",
       "https://*.current-rms.com/projects*"
     ],
-    "js": ["scripts/content.js", "scripts/addtab.js"],
+    "js": ["scripts/transfer-out.js", "scripts/content.js", "scripts/addtab.js"],
     "css": ["style.css"],
     "run_at": "document_end"
     },

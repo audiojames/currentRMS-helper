@@ -320,15 +320,32 @@ const explicitDetailView = opportunityShowPath && opportunityViewParam === "d";
 orderView          = !otherKnownView && (domOrderView || explicitOrderView);
 detailView         = !otherKnownView && !orderView && (explicitDetailView || (domDetailView && opportunityShowPath && opportunityViewParam !== "o" && opportunityViewParam !== "c"));
 
-// Lazy-load transfer out module.
-if (detailView) {
-    import(chrome.runtime.getURL('scripts/transfer-out.js')).then((mod) => {
-        if (mod && typeof mod.initTransferOut === 'function') {
-            mod.initTransferOut();
-        }
-    }).catch((err) => {
-        console.error('Failed to load transfer out module', err);
-    });
+// Lazy-load transfer out module. Current can render detail sections after
+// document_end, so URL-shape is a better trigger than the initial DOM state.
+function shouldLoadTransferOutModule() {
+	const opportunityDetailPath = /^\/opportunities\/\d+(?:\/section)?\/?$/.test(window.location.pathname);
+	if (!opportunityDetailPath) {
+		return false;
+	}
+
+	const params = new URLSearchParams(window.location.search);
+	const view = params.get('view');
+	const section = params.get('section');
+	return view === null || view === 'd' || section === 'items';
+}
+
+if (shouldLoadTransferOutModule()) {
+	if (typeof globalThis.initTransferOut === 'function') {
+		globalThis.initTransferOut();
+	} else {
+		import(chrome.runtime.getURL('scripts/transfer-out.js')).then(() => {
+			if (typeof globalThis.initTransferOut === 'function') {
+				globalThis.initTransferOut();
+			}
+		}).catch((err) => {
+			console.error('Failed to load transfer out module', err);
+		});
+	}
 }
 
 
@@ -1041,6 +1058,40 @@ function initEditOpportunityView() {
 		return updatedDate;
 	};
 
+	const moveToCalendarDate = function(date, targetDate) {
+		const updatedDate = new Date(date.getTime());
+		updatedDate.setFullYear(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate());
+		return updatedDate;
+	};
+
+	const getScheduleDateType = function(input) {
+		const associatedLabel = Array.from(oppForm.querySelectorAll('label')).find(label => label.htmlFor === input.id);
+		const inputGroup = input.closest('.form-group');
+		const description = [
+			input.id,
+			input.name,
+			input.getAttribute('aria-label'),
+			input.getAttribute('placeholder'),
+			associatedLabel?.textContent,
+			inputGroup?.className
+		].filter(Boolean).join(' ').toLowerCase();
+
+		// Current RMS calls the Collection Date field "collect_starts_at",
+		// even though it is the end-date counterpart to Delivery Date.
+		if (/(^|[\s_-])collect(?:ion)?([\s_-]|$)/.test(description)) {
+			return 'end';
+		}
+
+		const isStartDate = /(^|[\s_-])start(?:s|ing)?([\s_-]|$)/.test(description);
+		const isEndDate = /(^|[\s_-])end(?:s|ing)?([\s_-]|$)/.test(description);
+
+		if (isStartDate === isEndDate) {
+			return null;
+		}
+
+		return isStartDate ? 'start' : 'end';
+	};
+
 	const setInputBaseline = function(input) {
 		if (!input.value) {
 			delete input.dataset.helperBaselineValue;
@@ -1122,14 +1173,16 @@ function initEditOpportunityView() {
 
 		const helperButtonCol = helperButtonRow.querySelector('.col-md-12');
 
-		const updateOthersButton = createScheduleButton('update-other-dates', 'Update Others');
+		const updateMatchingDatesButton = createScheduleButton('update-matching-dates', 'Update Matching Dates');
+		const updateOthersButton = createScheduleButton('update-other-dates', 'Update All Dates');
 		const resetDatesButton = createScheduleButton('reset-all-dates', 'Clear All Dates');
 
 		helperButtonCol.innerHTML = '';
+		helperButtonCol.appendChild(updateMatchingDatesButton);
 		helperButtonCol.appendChild(updateOthersButton);
 		helperButtonCol.appendChild(resetDatesButton);
 
-		const updateUpdateOthersButton = function() {
+		const updateDateButtons = function() {
 			let sourceInput = document.getElementById(lastEditedScheduleInputId);
 
 			if (sourceInput) {
@@ -1146,8 +1199,10 @@ function initEditOpportunityView() {
 			}
 
 			if (!sourceInput) {
+				updateMatchingDatesButton.style.display = 'none';
+				updateMatchingDatesButton.innerText = 'Update Matching Dates';
 				updateOthersButton.style.display = 'none';
-				updateOthersButton.innerText = 'Update Others';
+				updateOthersButton.innerText = 'Update All Dates';
 				return null;
 			}
 
@@ -1156,14 +1211,32 @@ function initEditOpportunityView() {
 			const relativeChange = getRelativeDateChange(baselineDate, currentDate);
 
 			if (!currentDate || !relativeChange) {
+				updateMatchingDatesButton.style.display = 'none';
+				updateMatchingDatesButton.innerText = 'Update Matching Dates';
 				updateOthersButton.style.display = 'none';
-				updateOthersButton.innerText = 'Update Others';
+				updateOthersButton.innerText = 'Update All Dates';
 				return null;
 			}
 
+			const sourceDateType = getScheduleDateType(sourceInput);
+			const matchingDateInputs = sourceDateType ? relativeDateInputs.filter(input =>
+				input !== sourceInput &&
+				input.value &&
+				getScheduleDateType(input) === sourceDateType
+			) : [];
+
+			if (matchingDateInputs.length > 0) {
+				const dateTypeLabel = sourceDateType === 'start' ? 'Start' : 'End';
+				updateMatchingDatesButton.style.display = '';
+				updateMatchingDatesButton.innerText = `Set All ${dateTypeLabel} Dates to ${formatDateOnly(currentDate)}`;
+			} else {
+				updateMatchingDatesButton.style.display = 'none';
+				updateMatchingDatesButton.innerText = 'Update Matching Dates';
+			}
+
 			updateOthersButton.style.display = '';
-			updateOthersButton.innerText = `Update Others (${describeRelativeDateChange(relativeChange)} to ${formatDateOnly(currentDate)})`;
-			return { sourceInput, relativeChange };
+			updateOthersButton.innerText = `Update All Dates (${describeRelativeDateChange(relativeChange)} to ${formatDateOnly(currentDate)})`;
+			return { sourceInput, currentDate, relativeChange, matchingDateInputs };
 		};
 
 		scheduleInputs.forEach(input => {
@@ -1175,7 +1248,7 @@ function initEditOpportunityView() {
 						lastEditedScheduleInputId = input.id;
 					}
 
-					updateUpdateOthersButton();
+					updateDateButtons();
 				});
 			});
 
@@ -1184,16 +1257,41 @@ function initEditOpportunityView() {
 					lastEditedScheduleInputId = input.id;
 				}
 
-				updateUpdateOthersButton();
+				updateDateButtons();
 			});
 
 			inputObserver.observe(input, { attributes: true, attributeFilter: ['data-iso-value', 'value'] });
 		});
 
-		updateUpdateOthersButton();
+		updateDateButtons();
+
+		updateMatchingDatesButton.addEventListener('click', function() {
+			const updateConfig = updateDateButtons();
+
+			if (!updateConfig) {
+				return;
+			}
+
+			const { sourceInput, currentDate, matchingDateInputs } = updateConfig;
+
+			matchingDateInputs.forEach(input => {
+				const inputBaselineDate = parseDateInputValue(input.dataset.helperBaselineValue || '');
+
+				if (!inputBaselineDate) {
+					return;
+				}
+
+				const updatedDate = moveToCalendarDate(inputBaselineDate, currentDate);
+				applyDateToInput(input, updatedDate);
+				setInputBaseline(input);
+			});
+
+			setInputBaseline(sourceInput);
+			updateDateButtons();
+		});
 
 		updateOthersButton.addEventListener('click', function() {
-			const updateConfig = updateUpdateOthersButton();
+			const updateConfig = updateDateButtons();
 
 			if (!updateConfig) {
 				return;
@@ -1224,7 +1322,7 @@ function initEditOpportunityView() {
 			});
 
 			setInputBaseline(sourceInput);
-			updateUpdateOthersButton();
+			updateDateButtons();
 		});
 
 		resetDatesButton.addEventListener('click', function() {
@@ -1237,7 +1335,7 @@ function initEditOpportunityView() {
 			});
 
 			relativeDateInputs.forEach(input => setInputBaseline(input));
-			updateUpdateOthersButton();
+			updateDateButtons();
 		});
 
 	} else {

@@ -2,18 +2,27 @@ let transferOutInitAttempts = 0;
 let transferOutCachedAssets = [];
 let transferOutStylesInjected = false;
 let transferOutSearchTimer = null;
+let transferOutObserver = null;
+let transferOutObserverTimer = null;
 
-export function initTransferOut() {
-	if (document.querySelector('.helper-transfer-out-selected')) {
+function initTransferOut() {
+	if (!isTransferOutEligiblePage()) {
 		return;
 	}
 
-	const actionMenu = document.querySelector('.quick-function-section .dropdown-menu');
+	const actionMenu = findTransferOutActionMenu();
 	if (!actionMenu) {
-		if (transferOutInitAttempts < 10) {
+		startTransferOutObserver();
+		if (transferOutInitAttempts < 60) {
 			transferOutInitAttempts += 1;
 			setTimeout(initTransferOut, 500);
 		}
+		return;
+	}
+
+	if (actionMenu.querySelector('.helper-transfer-out-selected')) {
+		injectTransferOutModal();
+		startTransferOutObserver();
 		return;
 	}
 
@@ -38,7 +47,50 @@ export function initTransferOut() {
 	} else {
 		actionMenu.appendChild(newItem);
 	}
+
+	startTransferOutObserver();
 }
+
+function isTransferOutEligiblePage() {
+	return /^\/opportunities\/\d+(?:\/section)?\/?$/.test(window.location.pathname);
+}
+
+function findTransferOutActionMenu() {
+	const menus = Array.from(document.querySelectorAll('.quick-function-section .dropdown-menu'));
+	const actionMenu = menus.find(function(menu) {
+		return menu.querySelector('a.row-selector[href*="/revert_status"], a.row-selector[href*="/book_out"], a[href*="destroy_transfer_item_assets"]');
+	});
+
+	if (actionMenu) {
+		return actionMenu;
+	}
+
+	const actionLink = document.querySelector('a.row-selector[href*="/revert_status"], a.row-selector[href*="/book_out"], a[href*="destroy_transfer_item_assets"]');
+	return actionLink ? actionLink.closest('.dropdown-menu') : null;
+}
+
+function startTransferOutObserver() {
+	if (transferOutObserver || !document.body) {
+		return;
+	}
+
+	transferOutObserver = new MutationObserver(function() {
+		if (transferOutObserverTimer) {
+			clearTimeout(transferOutObserverTimer);
+		}
+		transferOutObserverTimer = setTimeout(function() {
+			transferOutObserverTimer = null;
+			initTransferOut();
+		}, 100);
+	});
+
+	transferOutObserver.observe(document.body, {
+		childList: true,
+		subtree: true
+	});
+}
+
+globalThis.initTransferOut = initTransferOut;
 
 function injectTransferOutModal() {
 	if (document.getElementById('helper-transfer-out-modal')) {
@@ -555,6 +607,9 @@ async function runTransferOutSelected() {
 	if (errors.length === 0) {
 		makeToast('toast-success', 'Transferred ' + assets.length + ' asset(s) to opportunity ' + targetId + '.', 5);
 		closeTransferOutModal();
+		setTimeout(function() {
+			window.location.reload();
+		}, 750);
 	} else {
 		const errorMessage = errors.join('\n');
 		const modalMessage = 'Finished with ' + errors.length + ' error(s):\n' + errors.join('\n');
